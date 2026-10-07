@@ -21,6 +21,13 @@ pub enum SessionEvent {
     Changed(Arc<FileDiff>),
     /// A previously changed file matches its baseline again.
     Reverted(String),
+    /// What to show while the session has no changes of its own: the
+    /// working tree's uncommitted changes against HEAD, or failing that, the
+    /// last commit. Replaces any previous fallback; empty `diffs` means none.
+    Fallback {
+        label: String,
+        diffs: Vec<Arc<FileDiff>>,
+    },
     Error(String),
 }
 
@@ -51,6 +58,7 @@ impl Session {
             seen: HashMap::new(),
             reported: HashSet::new(),
             seq: 0,
+            last_fallback: None,
         };
         std::thread::Builder::new()
             .name("diff-live-session".into())
@@ -92,7 +100,15 @@ struct Worker {
     /// Paths for which a `Changed` is currently outstanding.
     reported: HashSet<String>,
     seq: u64,
+    /// Label and file stats of the last fallback sent, to skip resending it.
+    last_fallback: Option<FallbackSignature>,
 }
+
+/// A fallback's label plus (path, added, removed) per file.
+type FallbackSignature = (String, Vec<(String, usize, usize)>);
+
+/// Cap on files in a fallback diff (e.g. a huge initial commit).
+const MAX_FALLBACK_FILES: usize = 200;
 
 /// Returned when the frontend has gone away.
 struct Disconnected;
@@ -108,8 +124,12 @@ impl Worker {
                 }
             }
         }
+        if self.refresh_fallback().is_err() {
+            return;
+        }
 
         while let Some(batch) = batches.next_batch() {
+            let git_changed = batch.iter().any(|p| is_git_ref_or_index(self.git.root(), p));
             let mut paths: Vec<String> = batch
                 .iter()
                 .filter_map(|p| relative(self.git.root(), p))
@@ -125,12 +145,87 @@ impl Worker {
                     HashSet::new()
                 }
             };
+            let had_changes = !self.reported.is_empty();
             for path in paths.iter().filter(|p| !ignored.contains(*p)) {
                 if self.process(path, false).is_err() {
                     return;
                 }
             }
+            // A commit, checkout or staging can change what the fallback shows,
+            // and so does the last session change being reverted.
+            let now_empty = self.reported.is_empty();
+            if now_empty && (git_changed || had_changes) && self.refresh_fallback().is_err() {
+                return;
+            }
         }
+    }
+
+    /// Recomputes the fallback and sends it if it changed.
+    fn refresh_fallback(&mut self) -> Result<(), Disconnected> {
+        let (label, diffs) = match self.fallback() {
+            Ok(fallback) => fallback,
+            Err(e) => return self.send(SessionEvent::Error(format!("fallback: {e}"))),
+        };
+        let signature = (
+            label.clone(),
+            diffs.iter().map(|d| (d.path.clone(), d.added, d.removed)).collect(),
+        );
+        if self.last_fallback.as_ref() == Some(&signature) {
+            return Ok(());
+        }
+        self.last_fallback = Some(signature);
+        self.send(SessionEvent::Fallback { label, diffs })
+    }
+
+    /// Uncommitted changes against HEAD if there are any, otherwise the
+    /// last commit against its parent.
+    fn fallback(&mut self) -> Result<(String, Vec<Arc<FileDiff>>)> {
+        let head = self.git.head_commit()?;
+        let dirty = self.git.dirty_paths()?;
+        let (label, pairs): (String, Vec<(String, Content, Content)>) = if !dirty.is_empty() {
+            let pairs = dirty
+                .into_iter()
+                .take(MAX_FALLBACK_FILES)
+                .map(|path| {
+                    let base = match &head {
+                        Some(head) => Content::from_blob(self.git.blob(head, &path)?),
+                        None => Content::Absent,
+                    };
+                    let current = Content::read(&self.git.root().join(&path));
+                    Ok((path, base, current))
+                })
+                .collect::<Result<_>>()?;
+            ("uncommitted changes vs HEAD".into(), pairs)
+        } else if let Some(head) = head {
+            let parent = self.git.parent(&head)?;
+            let pairs = self
+                .git
+                .changed_paths(parent.as_deref(), &head)?
+                .into_iter()
+                .take(MAX_FALLBACK_FILES)
+                .map(|path| {
+                    let base = match &parent {
+                        Some(parent) => Content::from_blob(self.git.blob(parent, &path)?),
+                        None => Content::Absent,
+                    };
+                    let current = Content::from_blob(self.git.blob(&head, &path)?);
+                    Ok((path, base, current))
+                })
+                .collect::<Result<_>>()?;
+            (format!("last commit {}", self.git.summary(&head)?), pairs)
+        } else {
+            return Ok((String::new(), Vec::new()));
+        };
+
+        let mut diffs = Vec::new();
+        for (path, base, current) in pairs {
+            self.seq += 1;
+            // Passing `current` as the previous version: nothing is "fresh".
+            if let Some(d) = diff::compute(&path, &base, Some(&current), &current, self.seq) {
+                diffs.push(Arc::new(d));
+            }
+        }
+        Ok((label, diffs))
     }
 
     fn process(&mut self, path: &str, initial: bool) -> Result<(), Disconnected> {
@@ -194,6 +289,16 @@ fn relative(root: &Path, path: &Path) -> Option<String> {
         }
     }
     (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// Whether `path` is git metadata that changes on commit, checkout, reset
+/// or staging.
+fn is_git_ref_or_index(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root.join(".git")) else {
+        return false;
+    };
+    let first = rel.components().next().and_then(|c| c.as_os_str().to_str());
+    matches!(first, Some("HEAD" | "index" | "refs" | "packed-refs"))
 }
 
 /// Editor swap files and atomic-save temp files that come and go.

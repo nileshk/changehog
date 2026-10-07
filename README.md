@@ -12,6 +12,10 @@ cargo run --release -- [PATH] [--base session|head]
   diff-live started. Changes stay visible even if the agent commits.
 - `--base head`: diff against HEAD at startup, including pre-existing changes.
 
+It cycles through the changed files continuously, jumping ahead to files as
+they change. Until the session has changes of its own, it shows uncommitted
+changes against HEAD, or if the tree is clean, the last commit.
+
 Keys: `j/k` scroll, `d/u` page, `n/p` next/previous file, `f` toggle follow,
 `q` quit. Any navigation pauses auto-follow; it resumes after 20s idle.
 

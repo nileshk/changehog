@@ -47,14 +47,53 @@ impl Git {
 
     /// The commit HEAD points at, or `None` for an unborn branch.
     pub fn head_commit(&self) -> Result<Option<String>> {
+        self.resolve("HEAD")
+    }
+
+    /// Resolves `rev` to a commit hash, `None` if it doesn't exist.
+    fn resolve(&self, rev: &str) -> Result<Option<String>> {
         let out = self
             .cmd()
-            .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+            .args(["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
             .output()?;
         if !out.status.success() {
             return Ok(None);
         }
         Ok(Some(String::from_utf8(out.stdout)?.trim().to_string()))
+    }
+
+    /// The first parent of `commit`, or `None` for a root commit.
+    pub fn parent(&self, commit: &str) -> Result<Option<String>> {
+        self.resolve(&format!("{commit}^"))
+    }
+
+    /// `<short hash> <subject>` for `commit`.
+    pub fn summary(&self, commit: &str) -> Result<String> {
+        let out = self
+            .cmd()
+            .args(["log", "-1", "--format=%h %s", commit])
+            .output()?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// Paths changed between `parent` and `commit` (every path in `commit`
+    /// when there's no parent).
+    pub fn changed_paths(&self, parent: Option<&str>, commit: &str) -> Result<Vec<String>> {
+        let mut cmd = self.cmd();
+        match parent {
+            Some(parent) => cmd.args(["diff", "--name-only", "-z", "--no-renames", parent, commit]),
+            None => cmd.args(["ls-tree", "-r", "-z", "--name-only", commit]),
+        };
+        let out = cmd.output()?;
+        if !out.status.success() {
+            bail!("git failed listing changes in {commit}");
+        }
+        Ok(out
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect())
     }
 
     /// Paths (relative to the root) that differ from HEAD: staged, unstaged,

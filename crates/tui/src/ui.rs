@@ -58,9 +58,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         .root()
         .file_name()
         .map_or_else(|| app.session.root().display().to_string(), |n| n.to_string_lossy().into_owned());
-    let base = match app.session.mode() {
-        BaseMode::SessionStart => "since session start",
-        BaseMode::Head => "since HEAD",
+    let base = match (app.director.fallback_label(), app.session.mode()) {
+        (Some(label), _) => label.to_string(),
+        (None, BaseMode::SessionStart) => "since session start".to_string(),
+        (None, BaseMode::Head) => "since HEAD".to_string(),
     };
     let follow = match app.director.resumes_in(now) {
         None => Span::styled("● following", Style::new().fg(Color::Green)),
@@ -122,7 +123,10 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::new()
         .borders(Borders::RIGHT)
         .border_style(Style::new().fg(palette::DIM))
-        .title(Span::styled(" Changed ", Style::new().fg(palette::DIM)));
+        .title(Span::styled(
+            if app.director.fallback_label().is_some() { " Files " } else { " Changed " },
+            Style::new().fg(palette::DIM),
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

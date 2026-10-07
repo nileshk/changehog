@@ -37,7 +37,7 @@ impl Content {
         }
     }
 
-    fn from_blob(blob: Option<Vec<u8>>) -> Content {
+    pub(crate) fn from_blob(blob: Option<Vec<u8>>) -> Content {
         match blob {
             None => Content::Absent,
             Some(b) if b.len() as u64 > MAX_FILE_BYTES => Content::TooLarge(b.len() as u64),
