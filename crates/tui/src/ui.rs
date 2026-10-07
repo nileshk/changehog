@@ -70,6 +70,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(palette::PAUSED),
         ),
     };
+    let cycle = Span::styled(
+        format!("⟳ {}", format_secs(app.director.cycle_dwell())),
+        Style::new().fg(palette::DIM),
+    );
     let files = app.director.files().count();
     let queued = app.director.queue_len();
     let sep = || Span::styled("  │  ", Style::new().fg(palette::DIM));
@@ -81,6 +85,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(base, Style::new().fg(palette::DIM)),
         sep(),
         follow,
+        Span::raw(" "),
+        cycle,
         sep(),
         Span::raw(format!("{files} file{}", if files == 1 { "" } else { "s" })),
     ];
@@ -105,6 +111,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ("d/u", "page"),
         ("n/p", "file"),
         ("f", "follow"),
+        ("+/-", "speed"),
         ("q", "quit"),
     ];
     let spans: Vec<Span> = keys
@@ -287,6 +294,16 @@ fn highlight(base: Color, fresh: Color, is_fresh: bool, fade: f32) -> Color {
     };
     let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * fade).round() as u8;
     Color::Rgb(mix(r1, r2), mix(g1, g2), mix(b1, b2))
+}
+
+/// "4s", "1.5s".
+fn format_secs(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f32();
+    if secs.fract() == 0.0 {
+        format!("{secs:.0}s")
+    } else {
+        format!("{secs:.1}s")
+    }
 }
 
 fn status_char(status: FileStatus) -> &'static str {

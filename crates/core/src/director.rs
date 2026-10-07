@@ -44,6 +44,21 @@ impl Default for DirectorConfig {
     }
 }
 
+/// Cycle dwell presets, fastest first, stepped through by
+/// [`Director::adjust_cycle`].
+pub const CYCLE_STEPS: [Duration; 10] = [
+    Duration::from_millis(1000),
+    Duration::from_millis(1500),
+    Duration::from_millis(2000),
+    Duration::from_millis(3000),
+    Duration::from_millis(4000),
+    Duration::from_millis(6000),
+    Duration::from_millis(8000),
+    Duration::from_millis(12000),
+    Duration::from_millis(20000),
+    Duration::from_millis(30000),
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Flip {
     pub from: Option<String>,
@@ -210,8 +225,28 @@ impl Director {
         if self.queue.is_empty() {
             return self.cfg.cycle_dwell;
         }
+        // Never linger on queued files longer than when idly cycling.
+        let base = self.cfg.dwell.min(self.cfg.cycle_dwell);
         let factor = 1.0 + self.queue.len() as f32 * 0.5;
-        self.cfg.dwell.div_f32(factor).max(self.cfg.min_dwell)
+        base.div_f32(factor).max(self.cfg.min_dwell.min(base))
+    }
+
+    /// How long each file is shown when cycling.
+    pub fn cycle_dwell(&self) -> Duration {
+        self.cfg.cycle_dwell
+    }
+
+    /// Steps the cycle dwell to the next faster or slower preset and
+    /// returns the new value.
+    pub fn adjust_cycle(&mut self, faster: bool) -> Duration {
+        let cur = self.cfg.cycle_dwell;
+        let next = if faster {
+            CYCLE_STEPS.iter().rev().find(|&&d| d < cur).unwrap_or(&CYCLE_STEPS[0])
+        } else {
+            CYCLE_STEPS.iter().find(|&&d| d > cur).unwrap_or(&CYCLE_STEPS[CYCLE_STEPS.len() - 1])
+        };
+        self.cfg.cycle_dwell = *next;
+        *next
     }
 
     fn show(&mut self, path: String, now: Instant) -> Flip {
@@ -364,6 +399,29 @@ mod tests {
             seen.push(cur(&d).unwrap().to_string());
         }
         assert_eq!(seen, ["a", "b", "c", "a", "b", "c", "a"]);
+    }
+
+    #[test]
+    fn cycle_speed_adjusts_through_presets() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        assert_eq!(d.adjust_cycle(true), secs(3.0));
+        assert_eq!(d.adjust_cycle(false), secs(4.0));
+        for _ in 0..20 {
+            d.adjust_cycle(true);
+        }
+        assert_eq!(d.cycle_dwell(), CYCLE_STEPS[0]);
+
+        // A custom value snaps to the neighbouring preset.
+        let mut d = Director::new(DirectorConfig { cycle_dwell: secs(5.0), ..Default::default() }, t0);
+        assert_eq!(d.adjust_cycle(false), secs(6.0));
+
+        // Faster cycling applies immediately, and caps the queued dwell too.
+        let mut d = Director::new(DirectorConfig { cycle_dwell: secs(1.0), ..Default::default() }, t0);
+        for p in ["a", "b", "c"] {
+            d.apply(&changed(p), t0);
+        }
+        assert!(d.tick(t0 + secs(1.0)).is_some());
     }
 
     #[test]

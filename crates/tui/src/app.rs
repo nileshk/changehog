@@ -26,10 +26,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(session: Session) -> Self {
+    pub fn new(session: Session, cycle: Duration) -> Self {
+        let cfg = DirectorConfig {
+            cycle_dwell: cycle,
+            ..DirectorConfig::default()
+        };
         Self {
             session,
-            director: Director::new(DirectorConfig::default(), Instant::now()),
+            director: Director::new(cfg, Instant::now()),
             scroll: 0.0,
             target: 0,
             viewport: 20,
@@ -150,6 +154,12 @@ impl App {
             }
             KeyCode::Char('p') | KeyCode::BackTab | KeyCode::Left => {
                 self.director.step(-1, now);
+            }
+            KeyCode::Char('+' | '=' | ']') => {
+                self.director.adjust_cycle(true);
+            }
+            KeyCode::Char('-' | '_' | '[') => {
+                self.director.adjust_cycle(false);
             }
             KeyCode::Char('f') => {
                 let follow = !self.director.following();

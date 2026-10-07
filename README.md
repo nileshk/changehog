@@ -11,13 +11,14 @@ cargo run --release -- [PATH] [--base session|head]
 - `--base session` (default): diff against the working tree as it was when
   diff-live started. Changes stay visible even if the agent commits.
 - `--base head`: diff against HEAD at startup, including pre-existing changes.
+- `--cycle SECONDS`: how long to show each file when cycling (default 4).
 
 It cycles through the changed files continuously, jumping ahead to files as
 they change. Until the session has changes of its own, it shows uncommitted
 changes against HEAD, or if the tree is clean, the last commit.
 
 Keys: `j/k` scroll, `d/u` page, `n/p` next/previous file, `f` toggle follow,
-`q` quit. Any navigation pauses auto-follow; it resumes after 20s idle.
+`+/-` cycle faster/slower, `q` quit. Any navigation pauses auto-follow; it resumes after 20s idle.
 
 ## Layout
 
