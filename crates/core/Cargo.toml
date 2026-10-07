@@ -1,0 +1,12 @@
+[package]
+name = "diff-live-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+notify = "8.2.0"
+similar = "3.2.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
