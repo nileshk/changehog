@@ -61,7 +61,7 @@ impl Session {
             last_fallback: None,
         };
         std::thread::Builder::new()
-            .name("diff-live-session".into())
+            .name("changehog-session".into())
             .spawn(move || worker.run(batches, dirty))?;
 
         Ok(Self {

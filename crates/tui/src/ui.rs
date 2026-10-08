@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use diff_live_core::{BaseMode, Body, DiffLine, FileDiff, FileStatus, LineKind};
+use changehog_core::{BaseMode, Body, DiffLine, FileDiff, FileStatus, LineKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -85,7 +85,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let queued = app.director.queue_len();
     let sep = || Span::styled("  │  ", Style::new().fg(palette::DIM));
     let mut spans = vec![
-        Span::styled(" diff-live ", Style::new().fg(Color::Black).bg(palette::ACCENT).bold()),
+        Span::styled(" changehog ", Style::new().fg(Color::Black).bg(palette::ACCENT).bold()),
         Span::raw(" "),
         Span::styled(repo, Style::new().bold()),
         sep(),

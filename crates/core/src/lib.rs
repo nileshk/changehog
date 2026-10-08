@@ -1,4 +1,4 @@
-//! Core engine for diff-live: watches a git working tree and produces live
+//! Core engine for changehog: watches a git working tree and produces live
 //! diffs. Frontend-agnostic; the TUI (and a future GUI) consume [`Session`]
 //! events and drive a [`Director`].
 

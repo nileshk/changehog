@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use diff_live_core::{BaseMode, Session};
+use changehog_core::{BaseMode, Session};
 use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use ratatui::crossterm::execute;
 
 /// Live, auto-following diff viewer for watching coding agents work.
 #[derive(Parser)]
-#[command(name = "diff-live", version)]
+#[command(name = "changehog", version)]
 struct Args {
     /// Repository (or any path inside it) to watch.
     #[arg(default_value = ".")]
@@ -38,9 +38,9 @@ fn parse_cycle(s: &str) -> Result<f32, String> {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Base {
-    /// The working tree when diff-live started (survives mid-session commits).
+    /// The working tree when changehog started (survives mid-session commits).
     Session,
-    /// The HEAD commit when diff-live started, including pre-existing changes.
+    /// The HEAD commit when changehog started, including pre-existing changes.
     Head,
 }
 

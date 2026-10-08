@@ -1,4 +1,4 @@
-# diff-live
+# changehog
 
 A live, auto-following diff viewer for watching coding agents (Claude Code,
 etc.) work. Run it in a split pane next to the agent: it shows what changed,
@@ -9,7 +9,7 @@ cargo run --release -- [PATH] [--base session|head]
 ```
 
 - `--base session` (default): diff against the working tree as it was when
-  diff-live started. Changes stay visible even if the agent commits.
+  changehog started. Changes stay visible even if the agent commits.
 - `--base head`: diff against HEAD at startup, including pre-existing changes.
 - `--cycle SECONDS`: how long to show each file when cycling (default 4).
 
@@ -22,7 +22,7 @@ Keys: `j/k` scroll, `d/u` page, `n/p` next/previous file, `f` toggle follow,
 `+/-` cycle faster/slower, `s` toggle the file sidebar, `q` quit.
 
 Mouse: click a file in the sidebar to jump to it, click `«` / `»` to collapse
-or expand the sidebar, and use the wheel to scroll. Since diff-live captures
+or expand the sidebar, and use the wheel to scroll. Since changehog captures
 the mouse, hold Option (macOS) or Shift (most Linux terminals) to select text.
 
 Any navigation pauses auto-follow; it resumes after 20s idle.

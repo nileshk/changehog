@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use diff_live_core::{BaseMode, FileStatus, Session, SessionEvent};
+use changehog_core::{BaseMode, FileStatus, Session, SessionEvent};
 
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")

@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use diff_live_core::{Director, DirectorConfig, Session, SessionEvent};
+use changehog_core::{Director, DirectorConfig, Session, SessionEvent};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
