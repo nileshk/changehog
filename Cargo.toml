@@ -5,3 +5,4 @@ members = ["crates/core", "crates/tui"]
 [workspace.package]
 edition = "2024"
 license = "MIT"
+authors = ["Nilesh Kapadia"]

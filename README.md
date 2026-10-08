@@ -45,3 +45,7 @@ Any navigation pauses auto-follow; it resumes after 20s idle.
 `target/` is marked ignored for Dropbox (`com.dropbox.ignored` and
 `com.apple.fileprovider.ignore#P` xattrs). If it's deleted, re-create it and
 re-apply the attributes, or builds will sync.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
