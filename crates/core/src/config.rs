@@ -40,6 +40,11 @@ pub struct Config {
     /// Wrap long lines instead of cutting them off.
     pub wrap: bool,
     pub sidebar: SidebarMode,
+    /// Show the git log panel.
+    pub log: bool,
+    /// Commits visible in the git log panel.
+    #[serde(deserialize_with = "log_rows")]
+    pub log_rows: u16,
 }
 
 impl Default for Config {
@@ -50,12 +55,15 @@ impl Default for Config {
             resume_after_seconds: 20.0,
             wrap: false,
             sidebar: SidebarMode::Auto,
+            log: true,
+            log_rows: 5,
         }
     }
 }
 
 pub const CYCLE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=600.0;
 pub const RESUME_RANGE: std::ops::RangeInclusive<f32> = 1.0..=3600.0;
+pub const LOG_ROWS_RANGE: std::ops::RangeInclusive<u16> = 1..=50;
 
 /// A commented config file with every setting at its default.
 pub const TEMPLATE: &str = r#"# changehog configuration
@@ -78,6 +86,12 @@ wrap = false
 # File sidebar: "auto" (open when the terminal is wide enough), "open" or
 # "closed".
 sidebar = "auto"
+
+# Show the git log panel at the bottom.
+log = true
+
+# Commits visible in the git log panel. 1 to 50.
+log_rows = 5
 "#;
 
 impl Config {
@@ -143,6 +157,19 @@ fn resume_after_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error
     in_range(d, RESUME_RANGE)
 }
 
+fn log_rows<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+    let value = u16::deserialize(d)?;
+    if LOG_ROWS_RANGE.contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "must be between {} and {}",
+            LOG_ROWS_RANGE.start(),
+            LOG_ROWS_RANGE.end()
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +200,8 @@ mod tests {
 
         assert!(Config::parse("sidebar = \"sometimes\"").is_err());
         assert!(Config::parse("base = \"HEAD\"").is_err());
+        assert!(Config::parse("log_rows = 0").is_err());
+        assert_eq!(Config::parse("log_rows = 12").unwrap().log_rows, 12);
     }
 
     #[test]

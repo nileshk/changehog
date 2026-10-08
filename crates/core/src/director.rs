@@ -15,7 +15,9 @@
 //! line takes.
 //!
 //! When the session has no changes of its own, the director shows the
-//! session's fallback diffs instead (e.g. the last commit).
+//! session's fallback diffs instead (e.g. the last commit). A commit can also
+//! be pinned: its files are shown and cycled through until it's unpinned,
+//! while live changes are recorded in the background.
 //!
 //! Time is passed in explicitly so the logic is deterministic and testable.
 
@@ -139,8 +141,16 @@ impl FileSet {
     }
 }
 
+/// A commit being viewed instead of live changes.
+struct Pinned {
+    id: String,
+    label: String,
+    files: FileSet,
+}
+
 pub struct Director {
     cfg: DirectorConfig,
+    pinned: Option<Pinned>,
     /// Files changed during the session, in order of first change.
     live: FileSet,
     /// Shown while `live` is empty.
@@ -167,6 +177,7 @@ impl Director {
     pub fn new(cfg: DirectorConfig, now: Instant) -> Self {
         Self {
             cfg,
+            pinned: None,
             live: FileSet::default(),
             fallback: FileSet::default(),
             fallback_label: None,
@@ -183,9 +194,12 @@ impl Director {
         }
     }
 
-    /// The set being displayed: live changes, or the fallback when there are none.
+    /// The set being displayed: a pinned commit, live changes, or the
+    /// fallback when there are none.
     fn active(&self) -> &FileSet {
-        if self.live.is_empty() {
+        if let Some(pinned) = &self.pinned {
+            &pinned.files
+        } else if self.live.is_empty() {
             &self.fallback
         } else {
             &self.live
@@ -195,6 +209,23 @@ impl Director {
     /// Applies a session event. Returns a flip if the visible file changed.
     pub fn apply(&mut self, event: &SessionEvent, now: Instant) -> Option<Flip> {
         match event {
+            SessionEvent::Changed(diff) if self.pinned.is_some() => {
+                // Recorded and queued for when the commit is unpinned.
+                self.live.insert(diff.clone());
+                if !self.queue.contains(&diff.path) {
+                    self.queue.push_back(diff.path.clone());
+                }
+                None
+            }
+            SessionEvent::Reverted(path) if self.pinned.is_some() => {
+                self.live.remove(path);
+                self.queue.retain(|p| p != path);
+                None
+            }
+            SessionEvent::Fallback { label, diffs } if self.pinned.is_some() => {
+                self.set_fallback(label, diffs);
+                None
+            }
             SessionEvent::Changed(diff) => {
                 let path = diff.path.clone();
                 self.live.insert(diff.clone());
@@ -232,11 +263,7 @@ impl Director {
                 None
             }
             SessionEvent::Fallback { label, diffs } => {
-                self.fallback = FileSet::default();
-                for diff in diffs {
-                    self.fallback.insert(diff.clone());
-                }
-                self.fallback_label = (!diffs.is_empty()).then(|| label.clone());
+                self.set_fallback(label, diffs);
                 let current_ok = self
                     .current
                     .as_ref()
@@ -252,8 +279,59 @@ impl Director {
                 let next = self.active().step_from(None, 0);
                 next.map(|next| self.show(next, now, At::Top))
             }
-            SessionEvent::Error(_) => None,
+            SessionEvent::Log(_) | SessionEvent::Commit { .. } | SessionEvent::Error(_) => None,
         }
+    }
+
+    fn set_fallback(&mut self, label: &str, diffs: &[Arc<FileDiff>]) {
+        self.fallback = FileSet::default();
+        for diff in diffs {
+            self.fallback.insert(diff.clone());
+        }
+        self.fallback_label = (!diffs.is_empty()).then(|| label.to_string());
+    }
+
+    /// Shows a commit's files instead of live changes until [`unpin`] is
+    /// called. Live changes keep being recorded and queued meanwhile.
+    /// Pauses auto-follow, like other navigation.
+    ///
+    /// [`unpin`]: Director::unpin
+    pub fn pin(&mut self, id: &str, label: &str, diffs: &[Arc<FileDiff>], now: Instant) -> Option<Flip> {
+        self.user_input(now);
+        let mut files = FileSet::default();
+        for diff in diffs {
+            files.insert(diff.clone());
+        }
+        self.pinned = Some(Pinned {
+            id: id.to_string(),
+            label: label.to_string(),
+            files,
+        });
+        self.current = None;
+        self.relayout();
+        let first = self.active().step_from(None, 0)?;
+        Some(self.show(first, now, At::Top))
+    }
+
+    /// Returns to live changes (or the fallback) and resumes auto-follow.
+    pub fn unpin(&mut self, now: Instant) -> Option<Flip> {
+        self.pinned.take()?;
+        self.following = true;
+        self.last_input = now;
+        self.current = None;
+        self.relayout();
+        let next = self.queue.pop_front().or_else(|| self.active().step_from(None, 0))?;
+        Some(self.show(next, now, At::Focus))
+    }
+
+    /// The id passed to [`Director::pin`], while a commit is pinned.
+    pub fn pinned(&self) -> Option<&str> {
+        self.pinned.as_ref().map(|p| p.id.as_str())
+    }
+
+    /// The label passed to [`Director::pin`], while a commit is pinned.
+    pub fn pinned_label(&self) -> Option<&str> {
+        self.pinned.as_ref().map(|p| p.label.as_str())
     }
 
     /// Advances time. Returns a transition when it's time for the next step:
@@ -266,7 +344,9 @@ impl Director {
         if !self.following || now.duration_since(self.shown_at) < self.current_dwell() {
             return None;
         }
-        if let Some(next) = self.queue.pop_front() {
+        if self.pinned.is_none()
+            && let Some(next) = self.queue.pop_front()
+        {
             return Some(Transition::Flip(self.show(next, now, At::Focus)));
         }
         if let Some(to) = self.next_stop() {
@@ -389,7 +469,7 @@ impl Director {
     }
 
     fn current_dwell(&self) -> Duration {
-        if self.queue.is_empty() {
+        if self.queue.is_empty() || self.pinned.is_some() {
             return self.cfg.cycle_dwell;
         }
         // Never linger on queued files longer than when idly cycling.
@@ -417,7 +497,9 @@ impl Director {
     }
 
     fn show(&mut self, path: String, now: Instant, at: At) -> Flip {
-        self.queue.retain(|p| p != &path);
+        if self.pinned.is_none() {
+            self.queue.retain(|p| p != &path);
+        }
         self.shown_at = now;
         self.hold_until = now + self.cfg.max_hold;
         let from = self.current.replace(path.clone());
@@ -476,7 +558,10 @@ impl Director {
 
     pub fn current(&self) -> Option<&Arc<FileDiff>> {
         let path = self.current.as_ref()?;
-        self.live.diffs.get(path).or_else(|| self.fallback.diffs.get(path))
+        match &self.pinned {
+            Some(pinned) => pinned.files.diffs.get(path),
+            None => self.live.diffs.get(path).or_else(|| self.fallback.diffs.get(path)),
+        }
     }
 
     /// The files being displayed: session changes in order of first change,
@@ -488,7 +573,7 @@ impl Director {
 
     /// Describes the fallback when it's what's being shown.
     pub fn fallback_label(&self) -> Option<&str> {
-        if self.live.is_empty() {
+        if self.live.is_empty() && self.pinned.is_none() {
             self.fallback_label.as_deref()
         } else {
             None
@@ -756,6 +841,30 @@ mod tests {
         assert!(!d.following());
         assert!(d.select("nope", t0).is_none());
         assert_eq!(cur(&d), Some("c"));
+    }
+
+    #[test]
+    fn pinned_commit_holds_until_unpinned() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        d.apply(&changed("live"), t0);
+        d.pin("abc", "commit abc", &[diff("x"), diff("y")], t0);
+        assert_eq!((cur(&d), d.pinned()), (Some("x"), Some("abc")));
+        assert_eq!(d.files().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["x", "y"]);
+
+        // Live changes don't take over, even once auto-follow resumes...
+        d.apply(&changed("new"), t0);
+        d.apply(&SessionEvent::Changed(shaped("x", "+++")), t0);
+        let t = t0 + secs(21.0);
+        assert!(matches!(d.tick(t), Some(Transition::Flip(f)) if f.to == "y"), "cycles the commit");
+        assert!(matches!(d.tick(t + secs(4.0)), Some(Transition::Flip(f)) if f.to == "x"));
+        assert_eq!(d.current().unwrap().lines().len(), 0, "the commit's x, not the live one");
+
+        // ...and are shown once it's unpinned, queued ones first.
+        d.unpin(t + secs(5.0));
+        assert_eq!((cur(&d), d.pinned()), (Some("new"), None));
+        assert!(d.following());
+        assert_eq!(d.files().count(), 3);
     }
 
     #[test]

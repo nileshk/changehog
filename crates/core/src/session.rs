@@ -11,7 +11,7 @@ use notify::RecommendedWatcher;
 
 use crate::baseline::{BaseMode, Baseline, Content};
 use crate::diff::{self, FileDiff};
-use crate::git::Git;
+use crate::git::{Commit, Git};
 use crate::timeline::{Change, Timeline};
 use crate::watch::{self, Batches};
 
@@ -28,12 +28,27 @@ pub enum SessionEvent {
         label: String,
         diffs: Vec<Arc<FileDiff>>,
     },
+    /// The newest commits, newest first. Sent at startup and whenever refs
+    /// change.
+    Log(Arc<Vec<Commit>>),
+    /// A commit's diff against its first parent, as requested with
+    /// [`Session::load_commit`].
+    Commit {
+        hash: String,
+        label: String,
+        diffs: Vec<Arc<FileDiff>>,
+    },
     Error(String),
 }
+
+/// Commits listed in [`SessionEvent::Log`].
+const LOG_LIMIT: usize = 500;
 
 pub struct Session {
     root: PathBuf,
     mode: BaseMode,
+    git: Arc<Git>,
+    tx: Sender<SessionEvent>,
     events: Receiver<SessionEvent>,
     timeline: Arc<Mutex<Timeline>>,
     _watcher: RecommendedWatcher,
@@ -41,7 +56,7 @@ pub struct Session {
 
 impl Session {
     pub fn start(path: &Path, mode: BaseMode) -> Result<Self> {
-        let git = Git::discover(path)?;
+        let git = Arc::new(Git::discover(path)?);
         let root = git.root().to_path_buf();
         // Start watching before capturing the baseline so no edit slips
         // between the two.
@@ -51,14 +66,15 @@ impl Session {
         let (tx, events) = mpsc::channel();
 
         let mut worker = Worker {
-            git,
+            git: git.clone(),
             baseline,
-            tx,
+            tx: tx.clone(),
             timeline: timeline.clone(),
             seen: HashMap::new(),
             reported: HashSet::new(),
             seq: 0,
             last_fallback: None,
+            last_log: None,
         };
         std::thread::Builder::new()
             .name("changehog-session".into())
@@ -67,6 +83,8 @@ impl Session {
         Ok(Self {
             root,
             mode,
+            git,
+            tx,
             events,
             timeline,
             _watcher: watcher,
@@ -88,10 +106,43 @@ impl Session {
     pub fn timeline(&self) -> &Arc<Mutex<Timeline>> {
         &self.timeline
     }
+
+    /// Loads `hash`'s diff in the background; it arrives as a
+    /// [`SessionEvent::Commit`] (or an `Error`).
+    pub fn load_commit(&self, hash: &str) {
+        let (git, tx, hash) = (self.git.clone(), self.tx.clone(), hash.to_string());
+        std::thread::spawn(move || {
+            let result = commit_diffs(&git, &hash)
+                .and_then(|diffs| Ok((format!("commit {}", git.summary(&hash)?), diffs)));
+            let _ = tx.send(match result {
+                Ok((label, diffs)) => SessionEvent::Commit { hash, label, diffs },
+                Err(e) => SessionEvent::Error(format!("commit {hash}: {e}")),
+            });
+        });
+    }
+}
+
+/// `commit`'s changes against its first parent (every file, for a root
+/// commit).
+fn commit_diffs(git: &Git, commit: &str) -> Result<Vec<Arc<FileDiff>>> {
+    let parent = git.parent(commit)?;
+    let mut diffs = Vec::new();
+    for path in git.changed_paths(parent.as_deref(), commit)?.into_iter().take(MAX_FALLBACK_FILES) {
+        let base = match &parent {
+            Some(parent) => Content::from_blob(git.blob(parent, &path)?),
+            None => Content::Absent,
+        };
+        let current = Content::from_blob(git.blob(commit, &path)?);
+        // Passing `current` as the previous version: nothing is "fresh".
+        if let Some(d) = diff::compute(&path, &base, Some(&current), &current, 0) {
+            diffs.push(Arc::new(d));
+        }
+    }
+    Ok(diffs)
 }
 
 struct Worker {
-    git: Git,
+    git: Arc<Git>,
     baseline: Baseline,
     tx: Sender<SessionEvent>,
     timeline: Arc<Mutex<Timeline>>,
@@ -102,12 +153,14 @@ struct Worker {
     seq: u64,
     /// Label and file stats of the last fallback sent, to skip resending it.
     last_fallback: Option<FallbackSignature>,
+    /// Hashes in the last log sent, to skip resending it.
+    last_log: Option<Vec<String>>,
 }
 
 /// A fallback's label plus (path, added, removed) per file.
 type FallbackSignature = (String, Vec<(String, usize, usize)>);
 
-/// Cap on files in a fallback diff (e.g. a huge initial commit).
+/// Cap on files in a fallback or commit diff (e.g. a huge initial commit).
 const MAX_FALLBACK_FILES: usize = 200;
 
 /// Returned when the frontend has gone away.
@@ -124,12 +177,15 @@ impl Worker {
                 }
             }
         }
-        if self.refresh_fallback().is_err() {
+        if self.refresh_fallback().is_err() || self.refresh_log().is_err() {
             return;
         }
 
         while let Some(batch) = batches.next_batch() {
             let git_changed = batch.iter().any(|p| is_git_ref_or_index(self.git.root(), p));
+            if git_changed && self.refresh_log().is_err() {
+                return;
+            }
             let mut paths: Vec<String> = batch
                 .iter()
                 .filter_map(|p| relative(self.git.root(), p))
@@ -177,45 +233,47 @@ impl Worker {
         self.send(SessionEvent::Fallback { label, diffs })
     }
 
+    /// Sends the log if it changed.
+    fn refresh_log(&mut self) -> Result<(), Disconnected> {
+        let commits = match self.git.log(LOG_LIMIT) {
+            Ok(commits) => commits,
+            Err(e) => return self.send(SessionEvent::Error(format!("git log: {e}"))),
+        };
+        let hashes: Vec<String> = commits.iter().map(|c| c.hash.clone()).collect();
+        if self.last_log.as_ref() == Some(&hashes) {
+            return Ok(());
+        }
+        self.last_log = Some(hashes);
+        self.send(SessionEvent::Log(Arc::new(commits)))
+    }
+
     /// Uncommitted changes against HEAD if there are any, otherwise the
     /// last commit against its parent.
     fn fallback(&mut self) -> Result<(String, Vec<Arc<FileDiff>>)> {
         let head = self.git.head_commit()?;
         let dirty = self.git.dirty_paths()?;
-        let (label, pairs): (String, Vec<(String, Content, Content)>) = if !dirty.is_empty() {
-            let pairs = dirty
-                .into_iter()
-                .take(MAX_FALLBACK_FILES)
-                .map(|path| {
-                    let base = match &head {
-                        Some(head) => Content::from_blob(self.git.blob(head, &path)?),
-                        None => Content::Absent,
-                    };
-                    let current = Content::read(&self.git.root().join(&path));
-                    Ok((path, base, current))
-                })
-                .collect::<Result<_>>()?;
-            ("uncommitted changes vs HEAD".into(), pairs)
-        } else if let Some(head) = head {
-            let parent = self.git.parent(&head)?;
-            let pairs = self
-                .git
-                .changed_paths(parent.as_deref(), &head)?
-                .into_iter()
-                .take(MAX_FALLBACK_FILES)
-                .map(|path| {
-                    let base = match &parent {
-                        Some(parent) => Content::from_blob(self.git.blob(parent, &path)?),
-                        None => Content::Absent,
-                    };
-                    let current = Content::from_blob(self.git.blob(&head, &path)?);
-                    Ok((path, base, current))
-                })
-                .collect::<Result<_>>()?;
-            (format!("last commit {}", self.git.summary(&head)?), pairs)
-        } else {
-            return Ok((String::new(), Vec::new()));
-        };
+        if dirty.is_empty() {
+            return match head {
+                Some(head) => Ok((
+                    format!("last commit {}", self.git.summary(&head)?),
+                    commit_diffs(&self.git, &head)?,
+                )),
+                None => Ok((String::new(), Vec::new())),
+            };
+        }
+        let pairs = dirty
+            .into_iter()
+            .take(MAX_FALLBACK_FILES)
+            .map(|path| {
+                let base = match &head {
+                    Some(head) => Content::from_blob(self.git.blob(head, &path)?),
+                    None => Content::Absent,
+                };
+                let current = Content::read(&self.git.root().join(&path));
+                Ok((path, base, current))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let label = "uncommitted changes vs HEAD".to_string();
 
         let mut diffs = Vec::new();
         for (path, base, current) in pairs {

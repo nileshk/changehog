@@ -21,8 +21,13 @@ cargo run --release -- [PATH] [--base session|head]
 
 It cycles through the changed files continuously, jumping ahead to files as
 they change. When a file's changes don't fit on screen, scrolling down to the
-next off-screen change is a step in the cycle, at the same interval. Until the session has changes of its own, it shows uncommitted
-changes against HEAD, or if the tree is clean, the last commit.
+next off-screen change is a step in the cycle, at the same interval. Until the
+session has changes of its own, it shows uncommitted changes against HEAD, or
+if the tree is clean, the last commit.
+
+A git log panel along the bottom lists recent commits, newest first, and
+updates as commits are made. Click one to cycle through its diff instead; new
+edits keep being recorded and are shown when you return to live changes.
 
 ## Configuration
 
@@ -41,6 +46,8 @@ mkdir -p ~/.config/changehog && changehog --print-config > ~/.config/changehog/c
 | `resume_after_seconds` | `20.0` | Idle time before auto-follow resumes (1 to 3600) |
 | `wrap` | `false` | Wrap long lines |
 | `sidebar` | `"auto"` | `"auto"`, `"open"` or `"closed"` |
+| `log` | `true` | Show the git log panel |
+| `log_rows` | `5` | Commits visible in the log panel (1 to 50) |
 
 Use `--config PATH` to read a different file. Changes made while running
 (speed, sidebar, wrap) aren't saved back to the file.
@@ -49,10 +56,13 @@ Use `--config PATH` to read a different file. Changes made while running
 
 Keys: `j/k` scroll, `d/u` page, `n/p` next/previous file, `f` toggle follow,
 `+/-` cycle faster/slower, `s` toggle the file sidebar, `w` toggle soft wrap,
-`q` quit.
+`l` toggle the git log panel, `{`/`}` shrink/grow it, `Esc` return from a
+commit to live changes, `q` quit.
 
 Mouse: click a file in the sidebar to jump to it, click `«` / `»` to collapse
-or expand the sidebar, and use the wheel to scroll. Since changehog captures
+or expand the sidebar, and use the wheel to scroll. In the git log panel,
+click a commit to show its diff (click it again to go back), drag the panel's
+top edge to resize it, and click `▾` / `▸` to hide or show it. Since changehog captures
 the mouse, hold Option (macOS) or Shift (most Linux terminals) to select text.
 
 Any navigation pauses auto-follow; it resumes after 20s idle.

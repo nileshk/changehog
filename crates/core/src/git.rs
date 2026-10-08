@@ -13,6 +13,17 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
+/// One entry of `git log`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Commit {
+    pub hash: String,
+    pub short: String,
+    pub author: String,
+    /// Author time, in seconds since the Unix epoch.
+    pub time: i64,
+    pub subject: String,
+}
+
 pub struct Git {
     root: PathBuf,
     cat_file: Mutex<Option<CatFile>>,
@@ -74,6 +85,31 @@ impl Git {
             .args(["log", "-1", "--format=%h %s", commit])
             .output()?;
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// The newest `limit` commits reachable from HEAD, newest first. Empty
+    /// on an unborn branch.
+    pub fn log(&self, limit: usize) -> Result<Vec<Commit>> {
+        let out = self
+            .cmd()
+            .args(["log", "-n", &limit.to_string(), "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s"])
+            .output()?;
+        if !out.status.success() {
+            return Ok(Vec::new()); // no commits yet
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut f = line.splitn(5, '\x1f');
+                Some(Commit {
+                    hash: f.next()?.to_string(),
+                    short: f.next()?.to_string(),
+                    author: f.next()?.to_string(),
+                    time: f.next()?.parse().ok()?,
+                    subject: f.next()?.to_string(),
+                })
+            })
+            .collect())
     }
 
     /// Paths changed between `parent` and `commit` (every path in `commit`

@@ -1,8 +1,11 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use changehog_core::config::LOG_ROWS_RANGE;
 use changehog_core::{
-    Config, Director, DirectorConfig, FileDiff, Measure, Session, SessionEvent, SidebarMode,
+    Commit, Config, Director, DirectorConfig, FileDiff, Measure, Session, SessionEvent,
+    SidebarMode,
 };
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -26,6 +29,10 @@ const WHEEL_LINES: isize = 3;
 pub enum Hit {
     File(String),
     ToggleSidebar,
+    Commit(String),
+    ToggleLog,
+    /// The log panel's top edge, which resizes it when dragged.
+    LogEdge,
 }
 
 pub struct App {
@@ -50,6 +57,18 @@ pub struct App {
     pub wrap: bool,
     /// (wrap, text area width) the director's measure was built for.
     measure_key: Option<(bool, usize)>,
+    /// Newest commits first.
+    pub commits: Arc<Vec<Commit>>,
+    pub log_open: bool,
+    /// Commits visible in the log panel.
+    pub log_rows: u16,
+    /// Index of the first commit shown in the log panel.
+    pub log_offset: usize,
+    /// The log panel's area, from the last render.
+    pub log_area: Rect,
+    /// Commit whose diff is being loaded.
+    pub loading: Option<String>,
+    dragging_log: bool,
     quit: bool,
 }
 
@@ -76,6 +95,13 @@ impl App {
             hits: Vec::new(),
             wrap: config.wrap,
             measure_key: None,
+            commits: Arc::new(Vec::new()),
+            log_open: config.log,
+            log_rows: config.log_rows,
+            log_offset: 0,
+            log_area: Rect::default(),
+            loading: None,
+            dragging_log: false,
             quit: false,
         }
     }
@@ -112,8 +138,23 @@ impl App {
     fn drain_session(&mut self, now: Instant) -> bool {
         let mut changed = false;
         while let Ok(event) = self.session.events().try_recv() {
-            if let SessionEvent::Error(e) = &event {
-                self.message = Some((e.clone(), now));
+            match &event {
+                SessionEvent::Error(e) => {
+                    if self.loading.as_ref().is_some_and(|h| e.starts_with(&format!("commit {h}"))) {
+                        self.loading = None;
+                    }
+                    self.message = Some((e.clone(), now));
+                }
+                SessionEvent::Log(commits) => {
+                    self.commits = commits.clone();
+                    self.log_offset = self.log_offset.min(self.commits.len().saturating_sub(1));
+                }
+                // Results for a commit no longer wanted are ignored.
+                SessionEvent::Commit { hash, label, diffs } if self.loading.as_ref() == Some(hash) => {
+                    self.loading = None;
+                    self.director.pin(hash, label, diffs, now);
+                }
+                _ => {}
             }
             self.director.apply(&event, now);
             changed = true;
@@ -172,6 +213,26 @@ impl App {
         self.sidebar = Some(!self.sidebar_open());
     }
 
+    /// Shows `hash`'s diff, or returns to live changes if it's already shown.
+    fn toggle_commit(&mut self, hash: &str, now: Instant) {
+        if self.director.pinned() == Some(hash) {
+            self.director.unpin(now);
+        } else {
+            self.loading = Some(hash.to_string());
+            self.session.load_commit(hash);
+        }
+    }
+
+    fn resize_log(&mut self, rows: i32) {
+        let (min, max) = (*LOG_ROWS_RANGE.start() as i32, *LOG_ROWS_RANGE.end() as i32);
+        self.log_rows = rows.clamp(min, max) as u16;
+    }
+
+    fn scroll_log(&mut self, delta: isize) {
+        let max = self.commits.len().saturating_sub(self.log_rows as usize);
+        self.log_offset = self.log_offset.saturating_add_signed(delta).min(max);
+    }
+
     fn on_mouse(&mut self, mouse: MouseEvent) {
         let now = Instant::now();
         match mouse.kind {
@@ -183,11 +244,28 @@ impl App {
                         self.director.select(&path, now);
                     }
                     Some(Hit::ToggleSidebar) => self.toggle_sidebar(),
+                    Some(Hit::Commit(hash)) => self.toggle_commit(&hash, now),
+                    Some(Hit::ToggleLog) => self.log_open = !self.log_open,
+                    Some(Hit::LogEdge) => self.dragging_log = true,
                     None => {}
                 }
             }
-            MouseEventKind::ScrollDown => self.director.scroll_by(WHEEL_LINES, now),
-            MouseEventKind::ScrollUp => self.director.scroll_by(-WHEEL_LINES, now),
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_log => {
+                // The edge follows the pointer; the panel ends where it did.
+                let bottom = (self.log_area.y + self.log_area.height) as i32;
+                self.resize_log(bottom - mouse.row as i32 - 1);
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.dragging_log = false,
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let down = mouse.kind == MouseEventKind::ScrollDown;
+                let over_log = self.log_open && self.log_area.contains(Position::new(mouse.column, mouse.row));
+                match (over_log, down) {
+                    (true, true) => self.scroll_log(1),
+                    (true, false) => self.scroll_log(-1),
+                    (false, true) => self.director.scroll_by(WHEEL_LINES, now),
+                    (false, false) => self.director.scroll_by(-WHEEL_LINES, now),
+                }
+            }
             _ => {}
         }
     }
@@ -199,7 +277,13 @@ impl App {
         let now = Instant::now();
         let page = self.viewport.saturating_sub(2).max(1) as isize;
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            // Esc backs out of a commit first.
+            KeyCode::Esc if self.loading.is_some() => self.loading = None,
+            KeyCode::Esc if self.director.pinned().is_some() => {
+                self.director.unpin(now);
+            }
+            KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.director.scroll_by(1, now),
             KeyCode::Char('k') | KeyCode::Up => self.director.scroll_by(-1, now),
@@ -221,6 +305,9 @@ impl App {
             }
             KeyCode::Char('s') => self.toggle_sidebar(),
             KeyCode::Char('w') => self.wrap = !self.wrap,
+            KeyCode::Char('l') => self.log_open = !self.log_open,
+            KeyCode::Char('{') => self.resize_log(self.log_rows as i32 - 1),
+            KeyCode::Char('}') => self.resize_log(self.log_rows as i32 + 1),
             KeyCode::Char('f') => {
                 let follow = !self.director.following();
                 self.director.set_following(follow, now);

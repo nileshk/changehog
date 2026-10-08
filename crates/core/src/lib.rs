@@ -15,4 +15,5 @@ pub use baseline::{BaseMode, Content};
 pub use config::{Config, SidebarMode};
 pub use diff::{Body, DiffLine, FileDiff, FileStatus, LineKind};
 pub use director::{CYCLE_STEPS, Director, DirectorConfig, Flip, Measure, Transition};
+pub use git::Commit;
 pub use session::{Session, SessionEvent};

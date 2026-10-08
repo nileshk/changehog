@@ -32,9 +32,16 @@ mod palette {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [header, body, footer] = Layout::vertical([
+    // Leave the diff at least a few rows however tall the log panel is set.
+    let log_rows = if app.log_open {
+        app.log_rows.min(frame.area().height.saturating_sub(6))
+    } else {
+        0
+    };
+    let [header, body, log, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1 + log_rows),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -43,6 +50,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_footer(frame, footer, app);
 
     app.hits.clear();
+    draw_log(frame, log, app);
     app.body_width = body.width;
     let side_width = if app.sidebar_open() {
         SIDEBAR_WIDTH.min(body.width / 2)
@@ -66,10 +74,15 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         .root()
         .file_name()
         .map_or_else(|| app.session.root().display().to_string(), |n| n.to_string_lossy().into_owned());
-    let base = match (app.director.fallback_label(), app.session.mode()) {
-        (Some(label), _) => label.to_string(),
-        (None, BaseMode::SessionStart) => "since session start".to_string(),
-        (None, BaseMode::Head) => "since HEAD".to_string(),
+    let base = if let Some(label) = app.director.pinned_label() {
+        Span::styled(format!("{label}  (esc: back to live)"), Style::new().fg(palette::ACCENT))
+    } else {
+        let text = match (app.director.fallback_label(), app.session.mode()) {
+            (Some(label), _) => label.to_string(),
+            (None, BaseMode::SessionStart) => "since session start".to_string(),
+            (None, BaseMode::Head) => "since HEAD".to_string(),
+        };
+        Span::styled(text, Style::new().fg(palette::DIM))
     };
     let follow = match app.director.resumes_in(now) {
         None => Span::styled("● following", Style::new().fg(Color::Green)),
@@ -90,7 +103,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" "),
         Span::styled(repo, Style::new().bold()),
         sep(),
-        Span::styled(base, Style::new().fg(palette::DIM)),
+        base,
         sep(),
         follow,
         Span::raw(" "),
@@ -123,6 +136,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ("+/-", "speed"),
         ("s", "sidebar"),
         ("w", "wrap"),
+        ("l", "log"),
         ("q", "quit"),
     ];
     let spans: Vec<Span> = keys
@@ -135,6 +149,116 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     frame.render_widget(Line::from(spans), area);
+}
+
+/// The git log panel: a title row (drag to resize; ▾/▸ hides and shows the
+/// list) over one row per commit, newest first. Clicking a commit shows its
+/// diff.
+fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.log_area = area;
+    let title_row = Rect { height: 1, ..area };
+    let title = if app.log_open { " Log " } else { " ▸ Log " };
+    let mut block = Block::new()
+        .borders(Borders::TOP)
+        .border_style(Style::new().fg(palette::DIM))
+        .title(Span::styled(title, Style::new().fg(palette::DIM)));
+    if !app.log_open {
+        frame.render_widget(block, area);
+        app.hits.push((title_row, Hit::ToggleLog));
+        return;
+    }
+    block = block.title_top(
+        Line::from(Span::styled("▾ ", Style::new().fg(palette::ACCENT).bold())).right_aligned(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // The ▾ button first, so it wins over the draggable edge it sits on.
+    app.hits.push((
+        Rect {
+            x: (area.x + area.width).saturating_sub(3),
+            width: 3.min(area.width),
+            ..title_row
+        },
+        Hit::ToggleLog,
+    ));
+    app.hits.push((title_row, Hit::LogEdge));
+
+    if app.commits.is_empty() {
+        frame.render_widget(
+            Line::styled(" No commits yet", Style::new().fg(palette::DIM)),
+            inner,
+        );
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let width = inner.width as usize;
+    let commits = app.commits.clone();
+    for (row, commit) in commits
+        .iter()
+        .skip(app.log_offset)
+        .take(inner.height as usize)
+        .enumerate()
+    {
+        let rect = Rect {
+            y: inner.y + row as u16,
+            height: 1,
+            ..inner
+        };
+        app.hits.push((rect, Hit::Commit(commit.hash.clone())));
+        let pinned = app.director.pinned() == Some(commit.hash.as_str());
+        let loading = app.loading.as_deref() == Some(commit.hash.as_str());
+        let marker = if pinned {
+            "▶ "
+        } else if loading {
+            "… "
+        } else {
+            "  "
+        };
+        let author: String = commit.author.chars().take(18).collect();
+        let right = format!("  {:>8}  {author} ", relative_age(now - commit.time));
+        let left_width = marker.chars().count() + commit.short.len() + 1;
+        let subject_width = width.saturating_sub(left_width + right.chars().count());
+        let subject = truncate_right(&commit.subject, subject_width);
+        let mut style = Style::new();
+        if pinned {
+            style = style.bg(Color::Rgb(40, 44, 56)).bold();
+        }
+        let line = Line::from(vec![
+            Span::styled(marker, Style::new().fg(palette::ACCENT)),
+            Span::styled(format!("{} ", commit.short), Style::new().fg(palette::PAUSED)),
+            Span::raw(format!("{subject:<subject_width$}")),
+            Span::styled(right, Style::new().fg(palette::DIM)),
+        ])
+        .style(style);
+        frame.render_widget(line, rect);
+    }
+}
+
+/// "now", "5m ago", "3h ago", "2d ago", "4mo ago", "1y ago".
+fn relative_age(secs: i64) -> String {
+    let secs = secs.max(0);
+    match secs {
+        0..60 => "now".into(),
+        60..3_600 => format!("{}m ago", secs / 60),
+        3_600..86_400 => format!("{}h ago", secs / 3_600),
+        86_400..2_592_000 => format!("{}d ago", secs / 86_400),
+        2_592_000..31_536_000 => format!("{}mo ago", secs / 2_592_000),
+        _ => format!("{}y ago", secs / 31_536_000),
+    }
+}
+
+/// Cuts `text` to `width` characters, ending with … when shortened.
+fn truncate_right(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    if width > 0 {
+        out.push('…');
+    }
+    out
 }
 
 /// A thin strip with an expand button; clicking anywhere on it expands.
@@ -152,7 +276,13 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
         .borders(Borders::RIGHT)
         .border_style(Style::new().fg(palette::DIM))
         .title(Span::styled(
-            if app.director.fallback_label().is_some() { " Files " } else { " Changed " },
+            if app.director.pinned().is_some() {
+                " Commit "
+            } else if app.director.fallback_label().is_some() {
+                " Files "
+            } else {
+                " Changed "
+            },
             Style::new().fg(palette::DIM),
         ))
         .title_top(Line::from(Span::styled("« ", Style::new().fg(palette::ACCENT).bold())).right_aligned());

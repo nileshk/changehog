@@ -32,11 +32,11 @@ fn next(session: &Session) -> SessionEvent {
         .expect("timed out waiting for a session event")
 }
 
-/// The next event that isn't a fallback update.
+/// The next event that isn't a fallback or log update.
 fn next_change(session: &Session) -> SessionEvent {
     loop {
         match next(session) {
-            SessionEvent::Fallback { .. } => continue,
+            SessionEvent::Fallback { .. } | SessionEvent::Log(_) => continue,
             other => return other,
         }
     }
@@ -142,4 +142,67 @@ fn fallback_returns_after_last_change_is_reverted() {
     assert!(matches!(next_change(&session), SessionEvent::Reverted(_)));
     // Same fallback as before, so it isn't resent; nothing else arrives.
     assert!(session.events().recv_timeout(Duration::from_millis(500)).is_err());
+}
+
+fn log(session: &Session) -> Vec<String> {
+    loop {
+        if let SessionEvent::Log(commits) = next(session) {
+            return commits.iter().map(|c| c.subject.clone()).collect();
+        }
+    }
+}
+
+#[test]
+fn log_lists_commits_and_updates_on_commit() {
+    let dir = repo();
+    std::fs::write(dir.path().join("b.txt"), "bee\n").unwrap();
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "second"]);
+
+    let session = Session::start(dir.path(), BaseMode::SessionStart).unwrap();
+    assert_eq!(log(&session), ["second", "init"], "newest first");
+    settle();
+
+    git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "third"]);
+    assert_eq!(log(&session), ["third", "second", "init"]);
+}
+
+#[test]
+fn load_commit_diffs_against_its_parent() {
+    let dir = repo();
+    std::fs::write(dir.path().join("a.txt"), "one\nTWO\nthree\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "bee\n").unwrap();
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "second"]);
+
+    let session = Session::start(dir.path(), BaseMode::SessionStart).unwrap();
+    let hashes: Vec<String> = loop {
+        if let SessionEvent::Log(commits) = next(&session) {
+            break commits.iter().map(|c| c.hash.clone()).collect();
+        }
+    };
+    // The root commit: every file is added.
+    session.load_commit(&hashes[1]);
+    let (label, diffs) = loop {
+        if let SessionEvent::Commit { hash, label, diffs } = next(&session) {
+            assert_eq!(hash, hashes[1]);
+            break (label, diffs);
+        }
+    };
+    assert!(label.starts_with("commit ") && label.ends_with("init"), "{label}");
+    let summary: Vec<_> = diffs.iter().map(|d| (d.path.as_str(), d.status, d.added, d.removed)).collect();
+    assert_eq!(
+        summary,
+        [(".gitignore", FileStatus::Added, 1, 0), ("a.txt", FileStatus::Added, 3, 0)]
+    );
+
+    session.load_commit(&hashes[0]);
+    let diffs = loop {
+        if let SessionEvent::Commit { diffs, .. } = next(&session) {
+            break diffs;
+        }
+    };
+    let summary: Vec<_> = diffs.iter().map(|d| (d.path.as_str(), d.added, d.removed)).collect();
+    assert_eq!(summary, [("a.txt", 1, 1), ("b.txt", 1, 0)]);
+    assert!(diffs.iter().all(|d| d.lines().iter().all(|l| !l.fresh)));
 }
