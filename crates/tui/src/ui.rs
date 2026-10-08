@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use crate::app::{App, FRESH_FADE, Hit};
+use crate::wrap;
 
 const SIDEBAR_WIDTH: u16 = 36;
 /// Width of the strip shown when the sidebar is collapsed.
@@ -94,6 +95,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         follow,
         Span::raw(" "),
         cycle,
+        Span::styled(if app.wrap { "  ↩ wrap" } else { "" }, Style::new().fg(palette::DIM)),
         sep(),
         Span::raw(format!("{files} file{}", if files == 1 { "" } else { "s" })),
     ];
@@ -120,6 +122,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ("f", "follow"),
         ("+/-", "speed"),
         ("s", "sidebar"),
+        ("w", "wrap"),
         ("q", "quit"),
     ];
     let spans: Vec<Span> = keys
@@ -238,6 +241,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(block, area);
     app.viewport = inner.height as usize;
     app.director.set_viewport(app.viewport);
+    app.sync_measure(inner.width as usize);
 
     let lines = match &diff.body {
         Body::Text(lines) => lines,
@@ -245,23 +249,26 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         Body::TooLarge => return placeholder(frame, inner, "File too large to diff"),
     };
 
-    let num_width = lines
-        .iter()
-        .filter_map(|l| l.old_no.max(l.new_no))
-        .max()
-        .unwrap_or(1)
-        .to_string()
-        .len()
-        .max(3);
+    let num_width = wrap::num_width(&diff);
     let fade = fade_amount(&diff);
-    let start = app.scroll.round() as usize;
-    for (row, line) in lines.iter().skip(start).take(inner.height as usize).enumerate() {
-        let rect = Rect {
-            y: inner.y + row as u16,
-            height: 1,
-            ..inner
-        };
-        frame.render_widget(render_line(line, num_width, fade), rect);
+    let wrap_width = app.wrap.then_some(inner.width as usize);
+    // Start partway into a line when the top row is a wrapped continuation.
+    let (first, mut skip) = app.director.line_at_row(app.scroll.round() as usize);
+    let mut row = 0;
+    'lines: for line in lines.iter().skip(first) {
+        for rendered in render_line(line, num_width, fade, wrap_width).into_iter().skip(skip) {
+            if row >= inner.height {
+                break 'lines;
+            }
+            let rect = Rect {
+                y: inner.y + row,
+                height: 1,
+                ..inner
+            };
+            frame.render_widget(rendered, rect);
+            row += 1;
+        }
+        skip = 0;
     }
 }
 
@@ -278,15 +285,48 @@ fn fade_amount(diff: &FileDiff) -> f32 {
     (1.0 - t) * (1.0 - t)
 }
 
-fn render_line(line: &DiffLine, num_width: usize, fade: f32) -> Line<'static> {
-    let num = |n: Option<usize>| n.map_or_else(|| " ".repeat(num_width), |n| format!("{n:>num_width$}"));
+/// Renders a diff line as one screen row, or as several when `wrap_width`
+/// is set and the line is longer than the area.
+fn render_line(
+    line: &DiffLine,
+    num_width: usize,
+    fade: f32,
+    wrap_width: Option<usize>,
+) -> Vec<Line<'static>> {
+    let text = wrap::display_text(line);
+    let pieces: Vec<String> = match wrap_width {
+        Some(width) => wrap::chunks(&text, wrap::text_width(line.kind, width, num_width))
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        None => vec![text],
+    };
+    pieces
+        .into_iter()
+        .enumerate()
+        .map(|(i, piece)| render_row(line, num_width, fade, piece, i > 0))
+        .collect()
+}
+
+/// One screen row of a diff line. Continuation rows of a wrapped line show
+/// `↪` instead of line numbers and the sign.
+fn render_row(
+    line: &DiffLine,
+    num_width: usize,
+    fade: f32,
+    text: String,
+    continuation: bool,
+) -> Line<'static> {
+    let num = |n: Option<usize>| match n {
+        Some(n) if !continuation => format!("{n:>num_width$}"),
+        _ => " ".repeat(num_width),
+    };
     let gutter_style = Style::new().fg(palette::DIM);
     let marker = if line.fresh {
         Span::styled("▎", Style::new().fg(palette::FRESH_MARK))
     } else {
         Span::raw(" ")
     };
-    let text = line.text.replace('\t', "    ");
 
     let (sign, fg, bg) = match line.kind {
         LineKind::HunkHeader => {
@@ -314,10 +354,15 @@ fn render_line(line: &DiffLine, num_width: usize, fade: f32) -> Line<'static> {
     if let Some(bg) = bg {
         style = style.bg(bg);
     }
+    let sign = if continuation {
+        Span::styled("↪ ", style.patch(gutter_style))
+    } else {
+        Span::styled(format!("{sign} "), style)
+    };
     Line::from(vec![
         marker,
         Span::styled(format!("{} {} ", num(line.old_no), num(line.new_no)), gutter_style),
-        Span::styled(format!("{sign} "), style),
+        sign,
         Span::styled(text, style),
     ])
     .style(bg.map_or_else(Style::new, |bg| Style::new().bg(bg)))

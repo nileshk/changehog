@@ -1,7 +1,9 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use changehog_core::{Config, Director, DirectorConfig, Session, SessionEvent, SidebarMode};
+use changehog_core::{
+    Config, Director, DirectorConfig, FileDiff, Measure, Session, SessionEvent, SidebarMode,
+};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -44,6 +46,10 @@ pub struct App {
     pub body_width: u16,
     /// Clickable regions from the last render.
     pub hits: Vec<(Rect, Hit)>,
+    /// Wrap long lines instead of cutting them off.
+    pub wrap: bool,
+    /// (wrap, text area width) the director's measure was built for.
+    measure_key: Option<(bool, usize)>,
     quit: bool,
 }
 
@@ -68,6 +74,8 @@ impl App {
             },
             body_width: 0,
             hits: Vec::new(),
+            wrap: config.wrap,
+            measure_key: None,
             quit: false,
         }
     }
@@ -140,6 +148,22 @@ impl App {
         scrolling || fading
     }
 
+    /// Gives the director a row measure matching the wrap setting and the
+    /// diff area's width, when either has changed.
+    pub fn sync_measure(&mut self, width: usize) {
+        let key = (self.wrap, width);
+        if self.measure_key == Some(key) {
+            return;
+        }
+        self.measure_key = Some(key);
+        let measure = self
+            .wrap
+            .then(|| Box::new(move |d: &FileDiff| crate::wrap::line_rows(d, width)) as Measure);
+        self.director.set_measure(measure);
+        // Row positions changed meaning; don't animate across the change.
+        self.scroll = self.director.scroll() as f32;
+    }
+
     pub fn sidebar_open(&self) -> bool {
         self.sidebar.unwrap_or(self.body_width >= SIDEBAR_AUTO_WIDTH)
     }
@@ -196,6 +220,7 @@ impl App {
                 self.director.adjust_cycle(false);
             }
             KeyCode::Char('s') => self.toggle_sidebar(),
+            KeyCode::Char('w') => self.wrap = !self.wrap,
             KeyCode::Char('f') => {
                 let follow = !self.director.following();
                 self.director.set_following(follow, now);

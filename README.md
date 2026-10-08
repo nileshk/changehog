@@ -16,6 +16,8 @@ cargo run --release -- [PATH] [--base session|head]
   changehog started. Changes stay visible even if the agent commits.
 - `--base head`: diff against HEAD at startup, including pre-existing changes.
 - `--cycle SECONDS`: how long to show each file when cycling (default 4).
+- `--wrap` / `--no-wrap`: wrap long lines instead of cutting them off at the
+  edge (default off).
 
 It cycles through the changed files continuously, jumping ahead to files as
 they change. When a file's changes don't fit on screen, scrolling down to the
@@ -46,7 +48,8 @@ Use `--config PATH` to read a different file. Changes made while running
 ## Controls
 
 Keys: `j/k` scroll, `d/u` page, `n/p` next/previous file, `f` toggle follow,
-`+/-` cycle faster/slower, `s` toggle the file sidebar, `q` quit.
+`+/-` cycle faster/slower, `s` toggle the file sidebar, `w` toggle soft wrap,
+`q` quit.
 
 Mouse: click a file in the sidebar to jump to it, click `«` / `»` to collapse
 or expand the sidebar, and use the wheel to scroll. Since changehog captures

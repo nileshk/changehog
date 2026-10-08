@@ -1,5 +1,6 @@
 mod app;
 mod ui;
+mod wrap;
 
 use std::path::PathBuf;
 

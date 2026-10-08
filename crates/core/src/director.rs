@@ -8,9 +8,11 @@
 //! step of its own, before moving on to the next file. Any user navigation
 //! pauses auto-follow; it resumes after a period of inactivity.
 //!
-//! The director owns the scroll position (in diff lines) so that frontends
-//! only need to report their viewport height and animate toward
-//! [`Director::scroll`].
+//! The director owns the scroll position so that frontends only need to
+//! report their viewport height and animate toward [`Director::scroll`].
+//! Positions are in screen rows: by default each diff line is one row, and a
+//! frontend that wraps long lines supplies a [`Measure`] giving the rows each
+//! line takes.
 //!
 //! When the session has no changes of its own, the director shows the
 //! session's fallback diffs instead (e.g. the last commit).
@@ -89,7 +91,10 @@ enum At {
     Top,
 }
 
-/// Lines of context kept above a change when scrolling to it.
+/// Returns how many screen rows each of a diff's lines takes.
+pub type Measure = Box<dyn Fn(&FileDiff) -> Vec<usize>>;
+
+/// Rows of context kept above a change when scrolling to it.
 const SCROLL_MARGIN: usize = 4;
 
 /// Diffs keyed by path, plus their display order.
@@ -149,9 +154,13 @@ pub struct Director {
     hold_until: Instant,
     following: bool,
     last_input: Instant,
-    /// Top line of the view, and the view's height, in diff lines.
+    /// Top row of the view, and the view's height, in screen rows.
     scroll: usize,
     viewport: usize,
+    measure: Option<Measure>,
+    /// First row of each line of the current diff, plus the total row count
+    /// as a final entry.
+    row_starts: Vec<usize>,
 }
 
 impl Director {
@@ -169,6 +178,8 @@ impl Director {
             last_input: now,
             scroll: 0,
             viewport: 20,
+            measure: None,
+            row_starts: vec![0],
         }
     }
 
@@ -187,6 +198,9 @@ impl Director {
             SessionEvent::Changed(diff) => {
                 let path = diff.path.clone();
                 self.live.insert(diff.clone());
+                if self.current.as_ref() == Some(&path) {
+                    self.relayout();
+                }
                 let showing_live = self.current.as_ref().is_some_and(|c| self.live.contains(c));
                 if !showing_live {
                     // Nothing shown, or only the fallback: jump straight to it.
@@ -211,6 +225,7 @@ impl Director {
                 self.queue.retain(|p| p != path);
                 if self.current.as_ref() == Some(path) {
                     self.current = None;
+                    self.relayout();
                     let next = self.queue.pop_front().or_else(|| self.active().step_from(None, 0));
                     return next.map(|next| self.show(next, now, At::Focus));
                 }
@@ -227,9 +242,13 @@ impl Director {
                     .as_ref()
                     .is_some_and(|c| self.live.contains(c) || self.fallback.contains(c));
                 if current_ok {
+                    // Its diff may have been replaced.
+                    self.relayout();
+                    self.scroll = self.clamp_scroll(self.scroll);
                     return None;
                 }
                 self.current = None;
+                self.relayout();
                 let next = self.active().step_from(None, 0);
                 next.map(|next| self.show(next, now, At::Top))
             }
@@ -268,46 +287,102 @@ impl Director {
         Transition::Scroll { from, to }
     }
 
-    /// Scroll position that brings the first change below the viewport on
-    /// screen, if there is one.
+    /// Scroll position that brings the next change that isn't fully on
+    /// screen into view, if there is one.
     fn next_stop(&self) -> Option<usize> {
         let bottom = self.scroll + self.viewport;
-        let (idx, _) = self
-            .lines()
-            .iter()
-            .enumerate()
-            .skip(bottom)
-            .find(|(_, l)| matches!(l.kind, LineKind::Added | LineKind::Removed))?;
         let margin = SCROLL_MARGIN.min(self.viewport / 4);
-        Some(self.clamp_scroll(idx.saturating_sub(margin).max(self.scroll + 1)))
+        let (i, _) = self.lines().iter().enumerate().find(|&(i, l)| {
+            matches!(l.kind, LineKind::Added | LineKind::Removed) && self.line_row(i + 1) > bottom
+        })?;
+        let start = self.line_row(i);
+        // A line that starts below the view is brought to the top; one that's
+        // already partly visible (a long wrapped line) is paged through.
+        let target = if start >= bottom { start } else { bottom }.saturating_sub(margin);
+        let to = self.clamp_scroll(target.max(self.scroll + 1));
+        (to > self.scroll).then_some(to)
     }
 
     fn lines(&self) -> &[DiffLine] {
         self.current().map_or(&[], |d| d.lines())
     }
 
+    /// First row of line `i` (the total row count for one past the end).
+    fn line_row(&self, i: usize) -> usize {
+        let total = self.total_rows();
+        self.row_starts.get(i).copied().unwrap_or(total)
+    }
+
+    fn total_rows(&self) -> usize {
+        self.row_starts.last().copied().unwrap_or(0)
+    }
+
     fn clamp_scroll(&self, scroll: usize) -> usize {
-        scroll.min(self.lines().len().saturating_sub(self.viewport))
+        scroll.min(self.total_rows().saturating_sub(self.viewport))
     }
 
     /// Puts the current file's focus line a third of the way down the view.
     fn focus_scroll(&self) -> usize {
         let focus = self.current().and_then(|d| d.focus).unwrap_or(0);
-        self.clamp_scroll(focus.saturating_sub(self.viewport / 3))
+        self.clamp_scroll(self.line_row(focus).saturating_sub(self.viewport / 3))
     }
 
-    /// The top line of the view, in diff lines.
+    /// Recomputes row positions for the current diff.
+    fn relayout(&mut self) {
+        let heights = match self.current() {
+            None => Vec::new(),
+            Some(diff) => {
+                let n = diff.lines().len();
+                self.measure
+                    .as_ref()
+                    .map(|m| m(diff))
+                    .filter(|h| h.len() == n)
+                    .unwrap_or_else(|| vec![1; n])
+            }
+        };
+        let mut starts = Vec::with_capacity(heights.len() + 1);
+        let mut row = 0;
+        starts.push(0);
+        for h in heights {
+            row += h.max(1);
+            starts.push(row);
+        }
+        self.row_starts = starts;
+    }
+
+    /// The top row of the view.
     pub fn scroll(&self) -> usize {
         self.scroll
     }
 
-    /// Tells the director how many diff lines fit on screen.
-    pub fn set_viewport(&mut self, lines: usize) {
-        self.viewport = lines.max(1);
+    /// First row of each line of the current diff, followed by the total
+    /// row count.
+    pub fn row_starts(&self) -> &[usize] {
+        &self.row_starts
+    }
+
+    /// The line containing `row`, and how many rows into it `row` is.
+    pub fn line_at_row(&self, row: usize) -> (usize, usize) {
+        let line = self.row_starts.partition_point(|&r| r <= row).saturating_sub(1);
+        (line, row - self.line_row(line).min(row))
+    }
+
+    /// Tells the director how many rows fit on screen.
+    pub fn set_viewport(&mut self, rows: usize) {
+        self.viewport = rows.max(1);
         self.scroll = self.clamp_scroll(self.scroll);
     }
 
-    /// Manually scrolls by `delta` lines. Pauses auto-follow.
+    /// Sets how many rows each line takes (`None`: one row per line). Keeps
+    /// the line at the top of the view in place.
+    pub fn set_measure(&mut self, measure: Option<Measure>) {
+        let (top_line, _) = self.line_at_row(self.scroll);
+        self.measure = measure;
+        self.relayout();
+        self.scroll = self.clamp_scroll(self.line_row(top_line));
+    }
+
+    /// Manually scrolls by `delta` rows. Pauses auto-follow.
     pub fn scroll_by(&mut self, delta: isize, now: Instant) {
         self.user_input(now);
         self.scroll = self.clamp_scroll(self.scroll.saturating_add_signed(delta));
@@ -346,6 +421,7 @@ impl Director {
         self.shown_at = now;
         self.hold_until = now + self.cfg.max_hold;
         let from = self.current.replace(path.clone());
+        self.relayout();
         self.scroll = match at {
             At::Focus => self.focus_scroll(),
             At::Top => 0,
@@ -592,6 +668,67 @@ mod tests {
         assert_eq!(d.scroll(), 0);
         assert!(matches!(d.tick(t0 + secs(4.0)), Some(Transition::Scroll { to: 13, .. })));
         assert_eq!(d.tick(t0 + secs(8.0)), Some(Transition::Scroll { from: 13, to: 0 }));
+    }
+
+    /// Each line takes `rows` rows, except lines whose shape char is `+`,
+    /// which take `tall`.
+    fn measure(tall: usize) -> Measure {
+        Box::new(move |d: &FileDiff| {
+            d.lines()
+                .iter()
+                .map(|l| if l.kind == LineKind::Added { tall } else { 1 })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn pages_through_a_change_taller_than_the_view() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        d.set_viewport(10);
+        d.set_measure(Some(measure(25)));
+        d.apply(&SessionEvent::Changed(shaped("long", "h+cc")), t0);
+        assert_eq!(d.row_starts(), &[0, 1, 26, 27, 28]);
+        assert_eq!(d.scroll(), 0);
+        let mut t = t0;
+        let mut step = || {
+            t += secs(4.0);
+            d.tick(t)
+        };
+        // Pages keep 2 rows (a quarter of the view) of overlap.
+        assert_eq!(step(), Some(Transition::Scroll { from: 0, to: 8 }));
+        assert_eq!(step(), Some(Transition::Scroll { from: 8, to: 16 }));
+        // The change now ends at the bottom of the view; only context is left.
+        assert_eq!(step(), Some(Transition::Scroll { from: 16, to: 0 }), "wraps to the top");
+    }
+
+    #[test]
+    fn wrapped_rows_count_toward_offscreen_changes() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        d.set_viewport(10);
+        // Two changes 6 lines apart: they fit on screen unwrapped...
+        let shape = format!("h+{}+", "c".repeat(5));
+        d.apply(&SessionEvent::Changed(shaped("f", &shape)), t0);
+        assert_eq!(d.tick(t0 + secs(4.0)), None);
+        // ...but not when each changed line wraps to 3 rows.
+        d.set_measure(Some(measure(3)));
+        assert_eq!(d.tick(t0 + secs(8.0)), Some(Transition::Scroll { from: 0, to: 2 }));
+    }
+
+    #[test]
+    fn changing_the_measure_keeps_the_top_line() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        d.set_viewport(5);
+        d.apply(&SessionEvent::Changed(shaped("f", &"+".repeat(20))), t0);
+        d.scroll_by(6, t0);
+        assert_eq!(d.line_at_row(d.scroll()), (6, 0));
+        d.set_measure(Some(measure(2)));
+        assert_eq!(d.scroll(), 12);
+        assert_eq!(d.line_at_row(13), (6, 1));
+        d.set_measure(None);
+        assert_eq!(d.scroll(), 6);
     }
 
     #[test]
