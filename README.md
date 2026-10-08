@@ -29,9 +29,10 @@ A git log panel along the bottom lists recent commits, newest first, and
 updates as commits are made. When there are uncommitted changes, its first row
 says so, with line counts and how many files are staged, unstaged and
 untracked (or `● uncommitted` in the title while the panel is hidden); click
-it to see those changes against HEAD. Click one to cycle through its diff
-instead; new edits keep being recorded and are shown when you return to live
-changes.
+it to see those changes against HEAD. That view updates live as files change:
+the latest edits are highlighted, and while following it moves to the file
+that just changed. Click one to cycle through its diff instead; new edits keep
+being recorded and are shown when you return to live changes.
 
 Playback (`P`, or `▶ play` on the log panel) steps through recent commits
 oldest first, from the selected commit (or the last 10) up to the newest. Each

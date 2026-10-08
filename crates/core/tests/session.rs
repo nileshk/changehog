@@ -305,3 +305,52 @@ fn reports_uncommitted_changes() {
     git(dir.path(), &["commit", "-qm", "all"]);
     while working_tree(&session).is_some() {}
 }
+
+fn uncommitted(session: &Session) -> Vec<std::sync::Arc<changehog_core::FileDiff>> {
+    loop {
+        if let SessionEvent::Commit { hash, diffs, .. } = next(session)
+            && hash == UNCOMMITTED
+        {
+            return diffs;
+        }
+    }
+}
+
+fn fresh_lines(diff: &changehog_core::FileDiff) -> Vec<&str> {
+    diff.lines().iter().filter(|l| l.fresh).map(|l| l.text.as_str()).collect()
+}
+
+#[test]
+fn refreshing_uncommitted_marks_only_new_edits_fresh() {
+    let dir = repo();
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    let session = Session::start(dir.path(), BaseMode::SessionStart).unwrap();
+
+    session.load_commit(UNCOMMITTED);
+    let diffs = uncommitted(&session);
+    assert!(fresh_lines(&diffs[0]).is_empty(), "first load: nothing fresh");
+
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "bee\n").unwrap();
+    session.refresh_uncommitted();
+    let diffs = uncommitted(&session);
+    let by_path = |p: &str| diffs.iter().find(|d| d.path == p).unwrap().clone();
+    assert_eq!(by_path("a.txt").added, 2, "still diffed against HEAD");
+    assert_eq!(fresh_lines(&by_path("a.txt")), ["five"]);
+    assert_eq!(fresh_lines(&by_path("b.txt")), ["bee"], "new files are all fresh");
+
+    // With no edits since, the latest edit stays fresh (same diff, so its
+    // highlight doesn't restart).
+    session.refresh_uncommitted();
+    let again = uncommitted(&session);
+    let a = again.iter().find(|d| d.path == "a.txt").unwrap();
+    assert_eq!(fresh_lines(a), ["five"]);
+    assert!(std::sync::Arc::ptr_eq(a, &by_path("a.txt")));
+
+    // The next edit moves the fresh marks to it.
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfour\nfive\nsix\n").unwrap();
+    session.refresh_uncommitted();
+    let diffs = uncommitted(&session);
+    let a = diffs.iter().find(|d| d.path == "a.txt").unwrap();
+    assert_eq!(fresh_lines(a), ["six"]);
+}

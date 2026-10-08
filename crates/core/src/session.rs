@@ -74,6 +74,9 @@ pub struct Session {
     tx: Sender<SessionEvent>,
     events: Receiver<SessionEvent>,
     log_filter: Arc<Mutex<LogFilter>>,
+    /// Per file, as of the last uncommitted-changes load, so a refresh can
+    /// mark what changed since as fresh.
+    uncommitted_seen: Arc<Mutex<Seen>>,
     timeline: Arc<Mutex<Timeline>>,
     _watcher: RecommendedWatcher,
 }
@@ -114,6 +117,7 @@ impl Session {
             tx,
             events,
             log_filter,
+            uncommitted_seen: Arc::default(),
             timeline,
             _watcher: watcher,
         })
@@ -155,13 +159,12 @@ impl Session {
     /// [`SessionEvent::Commit`] (or an `Error`). [`UNCOMMITTED`] loads
     /// uncommitted changes against HEAD.
     pub fn load_commit(&self, hash: &str) {
+        if hash == UNCOMMITTED {
+            return self.load_uncommitted(false);
+        }
         let (git, tx, hash) = (self.git.clone(), self.tx.clone(), hash.to_string());
         std::thread::spawn(move || {
-            let result = if hash == UNCOMMITTED {
-                git.dirty_paths()
-                    .and_then(|paths| uncommitted_diffs(&git, paths))
-                    .map(|diffs| (UNCOMMITTED_LABEL.to_string(), diffs))
-            } else {
+            let result = {
                 commit_diffs(&git, &hash)
                     .and_then(|diffs| Ok((format!("commit {}", git.summary(&hash)?), diffs)))
             };
@@ -171,26 +174,88 @@ impl Session {
             });
         });
     }
+
+    /// Reloads uncommitted changes in the background, marking lines that
+    /// changed since the last load as fresh. Arrives as a
+    /// [`SessionEvent::Commit`] with hash [`UNCOMMITTED`].
+    pub fn refresh_uncommitted(&self) {
+        self.load_uncommitted(true);
+    }
+
+    fn load_uncommitted(&self, since_last: bool) {
+        let (git, tx, seen) = (self.git.clone(), self.tx.clone(), self.uncommitted_seen.clone());
+        std::thread::spawn(move || {
+            let mut seen = seen.lock().unwrap();
+            let prev = since_last.then_some(&*seen);
+            let result = git.dirty_paths().and_then(|paths| uncommitted_diffs(&git, paths, prev));
+            let _ = tx.send(match result {
+                Ok((diffs, contents)) => {
+                    *seen = contents;
+                    SessionEvent::Commit {
+                        hash: UNCOMMITTED.to_string(),
+                        label: UNCOMMITTED_LABEL.to_string(),
+                        diffs,
+                    }
+                }
+                Err(e) => SessionEvent::Error(format!("commit {UNCOMMITTED}: {e}")),
+            });
+        });
+    }
 }
 
 const UNCOMMITTED_LABEL: &str = "uncommitted changes vs HEAD";
 
-/// `paths`' current contents against HEAD.
-fn uncommitted_diffs(git: &Git, paths: Vec<String>) -> Result<Vec<Arc<FileDiff>>> {
+/// What an uncommitted-changes load saw of one file.
+struct SeenFile {
+    /// The contents before the latest edit, which fresh lines are relative to.
+    before: Content,
+    current: Content,
+    diff: Option<Arc<FileDiff>>,
+}
+
+type Seen = HashMap<String, SeenFile>;
+
+/// `paths`' current contents against HEAD. With `prev` (from an earlier
+/// call), lines from each file's latest edit since then are fresh, and so is
+/// everything in a file that's new to it. A file that hasn't changed keeps
+/// its earlier diff, fresh lines and all. Without `prev`, nothing is fresh.
+fn uncommitted_diffs(
+    git: &Git,
+    paths: Vec<String>,
+    prev: Option<&Seen>,
+) -> Result<(Vec<Arc<FileDiff>>, Seen)> {
     let head = git.head_commit()?;
     let mut diffs = Vec::new();
+    let mut seen = HashMap::new();
     for path in paths.into_iter().take(MAX_FALLBACK_FILES) {
+        let current = Content::read(&git.root().join(&path));
+        let earlier = prev.and_then(|p| p.get(&path));
+        if let Some(earlier) = earlier.filter(|e| e.current == current) {
+            diffs.extend(earlier.diff.clone());
+            seen.insert(
+                path,
+                SeenFile {
+                    before: earlier.before.clone(),
+                    current,
+                    diff: earlier.diff.clone(),
+                },
+            );
+            continue;
+        }
         let base = match &head {
             Some(head) => Content::from_blob(git.blob(head, &path)?),
             None => Content::Absent,
         };
-        let current = Content::read(&git.root().join(&path));
-        // Passing `current` as the previous version: nothing is "fresh".
-        if let Some(d) = diff::compute(&path, &base, Some(&current), &current, 0) {
-            diffs.push(Arc::new(d));
-        }
+        let before = match (prev, earlier) {
+            (None, _) => current.clone(),
+            (Some(_), Some(earlier)) => earlier.current.clone(),
+            (Some(_), None) => base.clone(),
+        };
+        let diff = diff::compute(&path, &base, Some(&before), &current, 0).map(Arc::new);
+        diffs.extend(diff.clone());
+        seen.insert(path, SeenFile { before, current, diff });
     }
-    Ok(diffs)
+    Ok((diffs, seen))
 }
 
 /// Summarizes uncommitted changes, or `None` if there are none.
@@ -385,7 +450,8 @@ impl Worker {
                 None => Ok((String::new(), Vec::new())),
             };
         }
-        Ok((UNCOMMITTED_LABEL.to_string(), uncommitted_diffs(&self.git, dirty)?))
+        let (diffs, _) = uncommitted_diffs(&self.git, dirty, None)?;
+        Ok((UNCOMMITTED_LABEL.to_string(), diffs))
     }
 
     fn process(&mut self, path: &str, initial: bool) -> Result<(), Disconnected> {

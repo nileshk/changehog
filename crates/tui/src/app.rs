@@ -111,6 +111,10 @@ pub struct App {
     pub input: Option<FilterInput>,
     /// Uncommitted changes, shown as the log's first row.
     pub working_tree: Option<WorkingTree>,
+    /// The uncommitted-changes view is out of date, and whether a reload of
+    /// it is in progress.
+    uncommitted_stale: bool,
+    uncommitted_reloading: bool,
     playback_commits: usize,
     quit: bool,
 }
@@ -150,6 +154,8 @@ impl App {
             log_filter: LogFilter::default(),
             input: None,
             working_tree: None,
+            uncommitted_stale: false,
+            uncommitted_reloading: false,
             playback_commits: config.playback_commits as usize,
             quit: false,
         }
@@ -172,6 +178,7 @@ impl App {
 
             let now = Instant::now();
             dirty |= self.drain_session(now);
+            self.reload_uncommitted();
             dirty |= self.end_card(now);
             match self.director.tick(now) {
                 Some(Transition::EndOfPass) => self.next_commit(now),
@@ -211,6 +218,17 @@ impl App {
                     self.commits = commits.clone();
                     self.log_offset = self.log_offset.min(self.commits.len().saturating_sub(1));
                 }
+                // A reload of the uncommitted-changes view. (A fresh load of it
+                // the user asked for is handled below.) It's a no-op if
+                // something else has been pinned meanwhile.
+                SessionEvent::Commit { hash, diffs, .. }
+                    if hash == UNCOMMITTED
+                        && self.uncommitted_reloading
+                        && self.loading.as_deref() != Some(UNCOMMITTED) =>
+                {
+                    self.uncommitted_reloading = false;
+                    self.director.update_pinned(hash, diffs, now);
+                }
                 // Results for a commit no longer wanted are ignored.
                 SessionEvent::Commit { hash, label, diffs } if self.loading.as_ref() == Some(hash) => {
                     self.loading = None;
@@ -221,6 +239,16 @@ impl App {
                     }
                 }
                 _ => {}
+            }
+            // Any edit, or a change to what's staged, can change what the
+            // uncommitted-changes view should show.
+            if self.director.pinned() == Some(UNCOMMITTED)
+                && matches!(
+                    event,
+                    SessionEvent::Changed(_) | SessionEvent::Reverted(_) | SessionEvent::WorkingTree(Some(_))
+                )
+            {
+                self.uncommitted_stale = true;
             }
             self.director.apply(&event, now);
             // A new edit matters more than history: stop and show it.
@@ -443,6 +471,19 @@ impl App {
     fn resize_log(&mut self, rows: i32) {
         let (min, max) = (*LOG_ROWS_RANGE.start() as i32, *LOG_ROWS_RANGE.end() as i32);
         self.log_rows = rows.clamp(min, max) as u16;
+    }
+
+    /// Keeps the uncommitted-changes view live: reloads it when it's out of
+    /// date, one reload at a time.
+    fn reload_uncommitted(&mut self) {
+        if !self.uncommitted_stale || self.uncommitted_reloading {
+            return;
+        }
+        self.uncommitted_stale = false;
+        if self.director.pinned() == Some(UNCOMMITTED) {
+            self.uncommitted_reloading = true;
+            self.session.refresh_uncommitted();
+        }
     }
 
     /// Rows in the log list: the uncommitted-changes row, if any, then commits.

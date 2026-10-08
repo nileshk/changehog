@@ -345,6 +345,52 @@ impl Director {
         Some(self.show(first, now, At::Top))
     }
 
+    /// Replaces the pinned diffs (e.g. reloaded uncommitted changes) if `id`
+    /// is pinned, keeping the current file and scroll position. While
+    /// following, it behaves like live changes: it scrolls to fresh lines in
+    /// the current file, or moves to a file that has some.
+    pub fn update_pinned(&mut self, id: &str, diffs: &[Arc<FileDiff>], now: Instant) -> Option<Flip> {
+        let pinned = self.pinned.as_mut().filter(|p| p.id == id)?;
+        // Known files keep their place; new ones go at the end.
+        let mut files = FileSet::default();
+        for path in &pinned.files.order {
+            if let Some(d) = diffs.iter().find(|d| &d.path == path) {
+                files.insert(d.clone());
+            }
+        }
+        for d in diffs {
+            if !files.contains(&d.path) {
+                files.insert(d.clone());
+            }
+        }
+        let has_fresh = |d: &FileDiff| d.lines().iter().any(|l| l.fresh);
+        let first_fresh = files.order.iter().find(|p| has_fresh(&files.diffs[*p])).cloned();
+        pinned.files = files;
+
+        let current = self.current.clone().filter(|c| self.active().contains(c));
+        let current_fresh = self.current().is_some_and(|d| has_fresh(d));
+        match (current, first_fresh) {
+            (Some(_), _) if current_fresh && self.following => {
+                self.relayout();
+                self.scroll = self.focus_scroll();
+                self.shown_at = now.min(self.hold_until);
+                None
+            }
+            (_, Some(fresh)) if self.following => Some(self.show(fresh, now, At::Focus)),
+            (Some(_), _) => {
+                self.relayout();
+                self.scroll = self.clamp_scroll(self.scroll);
+                None
+            }
+            (None, _) => {
+                self.current = None;
+                self.relayout();
+                let first = self.active().step_from(None, 0)?;
+                Some(self.show(first, now, At::Top))
+            }
+        }
+    }
+
     /// Returns to live changes (or the fallback) and resumes auto-follow.
     pub fn unpin(&mut self, now: Instant) -> Option<Flip> {
         self.pinned.take()?;
@@ -937,6 +983,40 @@ mod tests {
         d.set_following(true, t0);
         assert!(matches!(d.tick(t0 + secs(4.0)), Some(Transition::Flip(_))));
         assert!(matches!(d.tick(t0 + secs(8.0)), Some(Transition::Flip(f)) if f.to == "a"));
+    }
+
+    fn fresh(path: &str, shape: &str) -> Arc<FileDiff> {
+        let mut d = (*shaped(path, shape)).clone();
+        if let Body::Text(lines) = &mut d.body {
+            for l in lines.iter_mut().filter(|l| l.kind == LineKind::Added) {
+                l.fresh = true;
+            }
+        }
+        Arc::new(d)
+    }
+
+    #[test]
+    fn updating_a_pinned_view_follows_fresh_changes() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        d.set_viewport(5);
+        d.pin("wt", "uncommitted", &[shaped("a", "+"), shaped("b", "+")], t0);
+        assert!(d.update_pinned("other", &[], t0).is_none(), "only the pinned id");
+
+        // Paused (pinning is navigation): content updates, view stays put.
+        d.update_pinned("wt", &[shaped("a", "++"), fresh("b", "+++")], t0);
+        assert_eq!(cur(&d), Some("a"));
+        assert_eq!(d.current().unwrap().lines().len(), 2);
+
+        // Following: moves to the file with fresh lines, new files at the end.
+        d.set_following(true, t0);
+        let flip = d.update_pinned("wt", &[shaped("a", "++"), shaped("b", "+++"), fresh("c", "+")], t0);
+        assert_eq!(flip.map(|f| f.to), Some("c".into()));
+        assert_eq!(d.files().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+
+        // The current file disappearing (e.g. reverted) moves to the first.
+        d.update_pinned("wt", &[shaped("a", "++")], t0);
+        assert_eq!(cur(&d), Some("a"));
     }
 
     #[test]
