@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use crate::app::{App, Card, FRESH_FADE, FilterField, Hit};
-use changehog_core::{AuthorFilter, LogFilter};
+use changehog_core::{AuthorFilter, Commit, LogFilter, UNCOMMITTED, WorkingTree};
 use crate::wrap;
 
 const SIDEBAR_WIDTH: u16 = 36;
@@ -188,6 +188,10 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
     let title_row = Rect { height: 1, ..area };
     let label = if app.log_open { " Log " } else { " ▸ Log " };
     let mut title = vec![Span::styled(label, Style::new().fg(palette::DIM))];
+    // Hidden, the panel still says when there are uncommitted changes.
+    if !app.log_open && app.working_tree.is_some() {
+        title.push(Span::styled("● uncommitted ", Style::new().fg(palette::PAUSED)));
+    }
     if let Some(desc) = describe_filter(&app.log_filter) {
         let chip = format!(" {desc} ✕ ");
         // Clicking the filter clears it.
@@ -255,7 +259,7 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
     ));
     app.hits.push((title_row, Hit::LogEdge));
 
-    if app.commits.is_empty() {
+    if app.log_len() == 0 {
         let msg = if app.log_filter.is_empty() { " No commits yet" } else { " No matching commits" };
         frame.render_widget(Line::styled(msg, Style::new().fg(palette::DIM)), inner);
         return;
@@ -265,20 +269,25 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
         .map_or(0, |d| d.as_secs() as i64);
     let width = inner.width as usize;
     let commits = app.commits.clone();
-    for (row, commit) in commits
-        .iter()
-        .skip(app.log_offset)
-        .take(inner.height as usize)
-        .enumerate()
-    {
+    let tree = app.working_tree.clone();
+    let rows = tree
+        .as_ref()
+        .map(LogRow::Uncommitted)
+        .into_iter()
+        .chain(commits.iter().map(LogRow::Commit));
+    for (row, entry) in rows.skip(app.log_offset).take(inner.height as usize).enumerate() {
         let rect = Rect {
             y: inner.y + row as u16,
             height: 1,
             ..inner
         };
-        app.hits.push((rect, Hit::Commit(commit.hash.clone())));
-        let pinned = app.director.pinned() == Some(commit.hash.as_str());
-        let loading = app.loading.as_deref() == Some(commit.hash.as_str());
+        let id = match entry {
+            LogRow::Uncommitted(_) => UNCOMMITTED,
+            LogRow::Commit(c) => c.hash.as_str(),
+        };
+        app.hits.push((rect, Hit::Commit(id.to_string())));
+        let pinned = app.director.pinned() == Some(id);
+        let loading = app.loading.as_deref() == Some(id);
         let marker = if pinned {
             "▶ "
         } else if loading {
@@ -286,15 +295,23 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             "  "
         };
+        let mut style = Style::new();
+        if pinned {
+            style = style.bg(Color::Rgb(40, 44, 56)).bold();
+        }
+        let commit = match entry {
+            LogRow::Commit(commit) => commit,
+            LogRow::Uncommitted(tree) => {
+                let line = uncommitted_row(tree, marker, width).style(style);
+                frame.render_widget(line, rect);
+                continue;
+            }
+        };
         let author: String = commit.author.chars().take(18).collect();
         let right = format!("  {:>8}  {author} ", relative_age(now - commit.time));
         let left_width = marker.chars().count() + commit.short.len() + 1;
         let subject_width = width.saturating_sub(left_width + right.chars().count());
         let subject = truncate_right(&commit.subject, subject_width);
-        let mut style = Style::new();
-        if pinned {
-            style = style.bg(Color::Rgb(40, 44, 56)).bold();
-        }
         let line = Line::from(vec![
             Span::styled(marker, Style::new().fg(palette::ACCENT)),
             Span::styled(format!("{} ", commit.short), Style::new().fg(palette::PAUSED)),
@@ -304,6 +321,30 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
         .style(style);
         frame.render_widget(line, rect);
     }
+}
+
+enum LogRow<'a> {
+    Uncommitted(&'a WorkingTree),
+    Commit(&'a Commit),
+}
+
+/// `● Uncommitted changes  +12 -4  3 files · 1 staged · 2 unstaged`
+fn uncommitted_row(tree: &WorkingTree, marker: &'static str, width: usize) -> Line<'static> {
+    let mut details = vec![format!("{} file{}", tree.files, if tree.files == 1 { "" } else { "s" })];
+    for (n, what) in [(tree.staged, "staged"), (tree.unstaged, "unstaged"), (tree.untracked, "untracked")] {
+        if n > 0 {
+            details.push(format!("{n} {what}"));
+        }
+    }
+    let details = truncate_right(&details.join(" · "), width.saturating_sub(40));
+    Line::from(vec![
+        Span::styled(marker, Style::new().fg(palette::ACCENT)),
+        Span::styled("● ", Style::new().fg(palette::PAUSED)),
+        Span::styled("Uncommitted changes  ", Style::new().fg(palette::PAUSED).bold()),
+        Span::styled(format!("+{}", tree.added), Style::new().fg(palette::ADD_FG)),
+        Span::styled(format!(" -{}  ", tree.removed), Style::new().fg(palette::DEL_FG)),
+        Span::styled(details, Style::new().fg(palette::DIM)),
+    ])
 }
 
 /// `message "fix" · by me`, or `None` with no filter.
@@ -360,7 +401,9 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
         .borders(Borders::RIGHT)
         .border_style(Style::new().fg(palette::DIM))
         .title(Span::styled(
-            if app.director.pinned().is_some() {
+            if app.director.pinned() == Some(UNCOMMITTED) {
+                " Uncommitted "
+            } else if app.director.pinned().is_some() {
                 " Commit "
             } else if app.director.fallback_label().is_some() {
                 " Files "

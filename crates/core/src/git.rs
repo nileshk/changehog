@@ -24,6 +24,17 @@ pub struct Commit {
     pub subject: String,
 }
 
+/// One path from `git status`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub path: String,
+    /// Has changes in the index.
+    pub staged: bool,
+    /// Has changes in the working tree that aren't staged.
+    pub unstaged: bool,
+    pub untracked: bool,
+}
+
 /// Narrows `git log`. Matching is case-insensitive and literal (not regex).
 /// With both set, a commit must match both.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -185,6 +196,28 @@ impl Git {
     /// Paths (relative to the root) that differ from HEAD: staged, unstaged,
     /// deleted or untracked. Ignored files are excluded.
     pub fn dirty_paths(&self) -> Result<Vec<String>> {
+        Ok(self.status()?.into_iter().map(|e| e.path).collect())
+    }
+
+    /// Lines added and removed in tracked files against HEAD, staged and
+    /// unstaged together. Binary files aren't counted. Zero with no HEAD.
+    pub fn line_stats_vs_head(&self) -> Result<(usize, usize)> {
+        let out = self.cmd().args(["diff", "HEAD", "--numstat", "--no-renames"]).output()?;
+        if !out.status.success() {
+            return Ok((0, 0));
+        }
+        let (mut added, mut removed) = (0, 0);
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut f = line.split('\t');
+            // Binary files show "-" for both counts.
+            added += f.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+            removed += f.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+        }
+        Ok((added, removed))
+    }
+
+    /// Changed paths with what kind of change each has.
+    pub fn status(&self) -> Result<Vec<StatusEntry>> {
         let out = self
             .cmd()
             .args([
@@ -198,11 +231,21 @@ impl Git {
         if !out.status.success() {
             bail!("git status failed: {}", String::from_utf8_lossy(&out.stderr));
         }
+        // "XY path": X is the index's status, Y the working tree's.
         Ok(out
             .stdout
             .split(|&b| b == 0)
             .filter(|entry| entry.len() > 3)
-            .map(|entry| String::from_utf8_lossy(&entry[3..]).into_owned())
+            .map(|entry| {
+                let (x, y) = (entry[0], entry[1]);
+                let untracked = x == b'?';
+                StatusEntry {
+                    path: String::from_utf8_lossy(&entry[3..]).into_owned(),
+                    staged: !untracked && x != b' ',
+                    unstaged: !untracked && y != b' ',
+                    untracked,
+                }
+            })
             .collect())
     }
 

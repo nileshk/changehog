@@ -2,7 +2,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use changehog_core::{AuthorFilter, BaseMode, FileStatus, LogFilter, Session, SessionEvent};
+use changehog_core::{
+    AuthorFilter, BaseMode, FileStatus, LogFilter, Session, SessionEvent, UNCOMMITTED, WorkingTree,
+};
 
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -36,7 +38,9 @@ fn next(session: &Session) -> SessionEvent {
 fn next_change(session: &Session) -> SessionEvent {
     loop {
         match next(session) {
-            SessionEvent::Fallback { .. } | SessionEvent::Log { .. } => continue,
+            SessionEvent::Fallback { .. } | SessionEvent::Log { .. } | SessionEvent::WorkingTree(_) => {
+                continue;
+            }
             other => return other,
         }
     }
@@ -249,4 +253,55 @@ fn log_filters_by_message_author_and_me() {
     // Both must match.
     assert_eq!(filtered(LogFilter { message: message("fix"), author: author("alice") }), ["Fix the parser"]);
     assert_eq!(filtered(LogFilter::default()).len(), 4);
+}
+
+fn working_tree(session: &Session) -> Option<WorkingTree> {
+    loop {
+        if let SessionEvent::WorkingTree(tree) = next(session) {
+            return tree;
+        }
+    }
+}
+
+#[test]
+fn reports_uncommitted_changes() {
+    let dir = repo();
+    let session = Session::start(dir.path(), BaseMode::SessionStart).unwrap();
+    assert_eq!(working_tree(&session), None, "clean at start");
+    settle();
+
+    // One staged edit (+1 -1), one unstaged on top of it (+1), one new file (+2).
+    std::fs::write(dir.path().join("a.txt"), "one\nTWO\nthree\n").unwrap();
+    git(dir.path(), &["add", "a.txt"]);
+    std::fs::write(dir.path().join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+    std::fs::write(dir.path().join("new.txt"), "x\ny\n").unwrap();
+    let tree = loop {
+        // Intermediate summaries may arrive as the edits land.
+        if let Some(tree) = working_tree(&session)
+            && tree.files == 2
+            && tree.added == 4
+        {
+            break tree;
+        }
+    };
+    assert_eq!(
+        tree,
+        WorkingTree { files: 2, staged: 1, unstaged: 1, untracked: 1, added: 4, removed: 1 }
+    );
+
+    session.load_commit(UNCOMMITTED);
+    let (label, diffs) = loop {
+        if let SessionEvent::Commit { hash, label, diffs } = next(&session) {
+            assert_eq!(hash, UNCOMMITTED);
+            break (label, diffs);
+        }
+    };
+    assert_eq!(label, "uncommitted changes vs HEAD");
+    let summary: Vec<_> = diffs.iter().map(|d| (d.path.as_str(), d.added, d.removed)).collect();
+    assert_eq!(summary, [("a.txt", 2, 1), ("new.txt", 2, 0)]);
+
+    // Committing everything makes it clean again.
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "all"]);
+    while working_tree(&session).is_some() {}
 }

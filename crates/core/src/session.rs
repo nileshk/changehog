@@ -41,8 +41,28 @@ pub enum SessionEvent {
         label: String,
         diffs: Vec<Arc<FileDiff>>,
     },
+    /// Uncommitted changes against HEAD (`None` when there are none). Sent
+    /// at startup and when it changes.
+    WorkingTree(Option<WorkingTree>),
     Error(String),
 }
+
+/// A summary of uncommitted changes against HEAD.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkingTree {
+    pub files: usize,
+    /// Files with staged changes, unstaged changes, or untracked. A file can
+    /// be both staged and unstaged.
+    pub staged: usize,
+    pub unstaged: usize,
+    pub untracked: usize,
+    /// Lines added and removed, untracked files included.
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Pass to [`Session::load_commit`] to load uncommitted changes against HEAD.
+pub const UNCOMMITTED: &str = "uncommitted";
 
 /// Commits listed in [`SessionEvent::Log`].
 const LOG_LIMIT: usize = 500;
@@ -81,6 +101,7 @@ impl Session {
             last_fallback: None,
             last_log: None,
             log_filter: log_filter.clone(),
+            last_tree: None,
         };
         std::thread::Builder::new()
             .name("changehog-session".into())
@@ -131,18 +152,71 @@ impl Session {
     }
 
     /// Loads `hash`'s diff in the background; it arrives as a
-    /// [`SessionEvent::Commit`] (or an `Error`).
+    /// [`SessionEvent::Commit`] (or an `Error`). [`UNCOMMITTED`] loads
+    /// uncommitted changes against HEAD.
     pub fn load_commit(&self, hash: &str) {
         let (git, tx, hash) = (self.git.clone(), self.tx.clone(), hash.to_string());
         std::thread::spawn(move || {
-            let result = commit_diffs(&git, &hash)
-                .and_then(|diffs| Ok((format!("commit {}", git.summary(&hash)?), diffs)));
+            let result = if hash == UNCOMMITTED {
+                git.dirty_paths()
+                    .and_then(|paths| uncommitted_diffs(&git, paths))
+                    .map(|diffs| (UNCOMMITTED_LABEL.to_string(), diffs))
+            } else {
+                commit_diffs(&git, &hash)
+                    .and_then(|diffs| Ok((format!("commit {}", git.summary(&hash)?), diffs)))
+            };
             let _ = tx.send(match result {
                 Ok((label, diffs)) => SessionEvent::Commit { hash, label, diffs },
                 Err(e) => SessionEvent::Error(format!("commit {hash}: {e}")),
             });
         });
     }
+}
+
+const UNCOMMITTED_LABEL: &str = "uncommitted changes vs HEAD";
+
+/// `paths`' current contents against HEAD.
+fn uncommitted_diffs(git: &Git, paths: Vec<String>) -> Result<Vec<Arc<FileDiff>>> {
+    let head = git.head_commit()?;
+    let mut diffs = Vec::new();
+    for path in paths.into_iter().take(MAX_FALLBACK_FILES) {
+        let base = match &head {
+            Some(head) => Content::from_blob(git.blob(head, &path)?),
+            None => Content::Absent,
+        };
+        let current = Content::read(&git.root().join(&path));
+        // Passing `current` as the previous version: nothing is "fresh".
+        if let Some(d) = diff::compute(&path, &base, Some(&current), &current, 0) {
+            diffs.push(Arc::new(d));
+        }
+    }
+    Ok(diffs)
+}
+
+/// Summarizes uncommitted changes, or `None` if there are none.
+fn working_tree(git: &Git) -> Result<Option<WorkingTree>> {
+    let status = git.status()?;
+    if status.is_empty() {
+        return Ok(None);
+    }
+    let (mut added, removed) = git.line_stats_vs_head()?;
+    // `git diff` doesn't see untracked files; count their lines directly.
+    for entry in status.iter().filter(|e| e.untracked).take(MAX_FALLBACK_FILES) {
+        if let Content::Bytes(bytes) = Content::read(&git.root().join(&entry.path))
+            && !bytes[..bytes.len().min(8000)].contains(&0)
+        {
+            added += bytes.split_inclusive(|&b| b == b'\n').count();
+        }
+    }
+    let count = |f: fn(&crate::git::StatusEntry) -> bool| status.iter().filter(|e| f(e)).count();
+    Ok(Some(WorkingTree {
+        files: status.len(),
+        staged: count(|e| e.staged),
+        unstaged: count(|e| e.unstaged),
+        untracked: count(|e| e.untracked),
+        added,
+        removed,
+    }))
 }
 
 /// `commit`'s changes against its first parent (every file, for a root
@@ -179,6 +253,8 @@ struct Worker {
     /// Hashes in the last log sent, to skip resending it.
     last_log: Option<(LogFilter, Vec<String>)>,
     log_filter: Arc<Mutex<LogFilter>>,
+    /// The last working-tree summary sent, to skip resending it.
+    last_tree: Option<Option<WorkingTree>>,
 }
 
 /// A fallback's label plus (path, added, removed) per file.
@@ -201,7 +277,10 @@ impl Worker {
                 }
             }
         }
-        if self.refresh_fallback().is_err() || self.refresh_log().is_err() {
+        if self.refresh_fallback().is_err()
+            || self.refresh_log().is_err()
+            || self.refresh_tree().is_err()
+        {
             return;
         }
 
@@ -237,6 +316,10 @@ impl Worker {
             if now_empty && (git_changed || had_changes) && self.refresh_fallback().is_err() {
                 return;
             }
+            let files_changed = paths.iter().any(|p| !ignored.contains(p));
+            if (files_changed || git_changed) && self.refresh_tree().is_err() {
+                return;
+            }
         }
     }
 
@@ -255,6 +338,19 @@ impl Worker {
         }
         self.last_fallback = Some(signature);
         self.send(SessionEvent::Fallback { label, diffs })
+    }
+
+    /// Sends the working-tree summary if it changed.
+    fn refresh_tree(&mut self) -> Result<(), Disconnected> {
+        let tree = match working_tree(&self.git) {
+            Ok(tree) => tree,
+            Err(e) => return self.send(SessionEvent::Error(format!("git status: {e}"))),
+        };
+        if self.last_tree.as_ref() == Some(&tree) {
+            return Ok(());
+        }
+        self.last_tree = Some(tree.clone());
+        self.send(SessionEvent::WorkingTree(tree))
     }
 
     /// Sends the log if it changed.
@@ -289,29 +385,7 @@ impl Worker {
                 None => Ok((String::new(), Vec::new())),
             };
         }
-        let pairs = dirty
-            .into_iter()
-            .take(MAX_FALLBACK_FILES)
-            .map(|path| {
-                let base = match &head {
-                    Some(head) => Content::from_blob(self.git.blob(head, &path)?),
-                    None => Content::Absent,
-                };
-                let current = Content::read(&self.git.root().join(&path));
-                Ok((path, base, current))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let label = "uncommitted changes vs HEAD".to_string();
-
-        let mut diffs = Vec::new();
-        for (path, base, current) in pairs {
-            self.seq += 1;
-            // Passing `current` as the previous version: nothing is "fresh".
-            if let Some(d) = diff::compute(&path, &base, Some(&current), &current, self.seq) {
-                diffs.push(Arc::new(d));
-            }
-        }
-        Ok((label, diffs))
+        Ok((UNCOMMITTED_LABEL.to_string(), uncommitted_diffs(&self.git, dirty)?))
     }
 
     fn process(&mut self, path: &str, initial: bool) -> Result<(), Disconnected> {

@@ -5,7 +5,7 @@ use anyhow::Result;
 use changehog_core::config::LOG_ROWS_RANGE;
 use changehog_core::{
     AuthorFilter, Commit, Config, Director, DirectorConfig, FileDiff, LogFilter, Measure,
-    Session, SessionEvent, SidebarMode, Transition,
+    Session, SessionEvent, SidebarMode, Transition, UNCOMMITTED, WorkingTree,
 };
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -109,6 +109,8 @@ pub struct App {
     pub card: Option<Card>,
     pub log_filter: LogFilter,
     pub input: Option<FilterInput>,
+    /// Uncommitted changes, shown as the log's first row.
+    pub working_tree: Option<WorkingTree>,
     playback_commits: usize,
     quit: bool,
 }
@@ -147,6 +149,7 @@ impl App {
             card: None,
             log_filter: LogFilter::default(),
             input: None,
+            working_tree: None,
             playback_commits: config.playback_commits as usize,
             quit: false,
         }
@@ -195,6 +198,13 @@ impl App {
                         self.loading = None;
                     }
                     self.message = Some((e.clone(), now));
+                }
+                SessionEvent::WorkingTree(tree) => {
+                    self.working_tree = tree.clone();
+                    // Viewing uncommitted changes that have just been committed.
+                    if tree.is_none() && self.director.pinned() == Some(UNCOMMITTED) {
+                        self.director.unpin(now);
+                    }
                 }
                 // Results for a filter no longer wanted are ignored.
                 SessionEvent::Log { filter, commits } if *filter == self.log_filter => {
@@ -435,8 +445,13 @@ impl App {
         self.log_rows = rows.clamp(min, max) as u16;
     }
 
+    /// Rows in the log list: the uncommitted-changes row, if any, then commits.
+    pub fn log_len(&self) -> usize {
+        self.commits.len() + usize::from(self.working_tree.is_some())
+    }
+
     fn scroll_log(&mut self, delta: isize) {
-        let max = self.commits.len().saturating_sub(self.log_rows as usize);
+        let max = self.log_len().saturating_sub(self.log_rows as usize);
         self.log_offset = self.log_offset.saturating_add_signed(delta).min(max);
     }
 
