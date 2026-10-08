@@ -5,7 +5,7 @@ use anyhow::Result;
 use changehog_core::config::LOG_ROWS_RANGE;
 use changehog_core::{
     Commit, Config, Director, DirectorConfig, FileDiff, Measure, Session, SessionEvent,
-    SidebarMode,
+    SidebarMode, Transition,
 };
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -33,6 +33,27 @@ pub enum Hit {
     ToggleLog,
     /// The log panel's top edge, which resizes it when dragged.
     LogEdge,
+    TogglePlayback,
+}
+
+/// Playing back commits, oldest first, one full pass each.
+pub struct Playback {
+    /// Hashes in play order (oldest first).
+    pub hashes: Vec<String>,
+    pub index: usize,
+}
+
+/// The title card shown before each commit during playback.
+pub struct Card {
+    pub commit: Commit,
+    /// 1-based position in the playback, and its length.
+    pub position: (usize, usize),
+    pub files: usize,
+    pub added: usize,
+    pub removed: usize,
+    until: Instant,
+    label: String,
+    diffs: Vec<Arc<FileDiff>>,
 }
 
 pub struct App {
@@ -69,6 +90,9 @@ pub struct App {
     /// Commit whose diff is being loaded.
     pub loading: Option<String>,
     dragging_log: bool,
+    pub playback: Option<Playback>,
+    pub card: Option<Card>,
+    playback_commits: usize,
     quit: bool,
 }
 
@@ -102,6 +126,9 @@ impl App {
             log_area: Rect::default(),
             loading: None,
             dragging_log: false,
+            playback: None,
+            card: None,
+            playback_commits: config.playback_commits as usize,
             quit: false,
         }
     }
@@ -123,7 +150,12 @@ impl App {
 
             let now = Instant::now();
             dirty |= self.drain_session(now);
-            dirty |= self.director.tick(now).is_some();
+            dirty |= self.end_card(now);
+            match self.director.tick(now) {
+                Some(Transition::EndOfPass) => self.next_commit(now),
+                Some(_) => dirty = true,
+                None => {}
+            }
             dirty |= self.animate(now);
 
             if dirty || last_draw.elapsed() >= IDLE_REDRAW {
@@ -152,11 +184,19 @@ impl App {
                 // Results for a commit no longer wanted are ignored.
                 SessionEvent::Commit { hash, label, diffs } if self.loading.as_ref() == Some(hash) => {
                     self.loading = None;
-                    self.director.pin(hash, label, diffs, now);
+                    if self.playback.is_some() {
+                        self.show_card(hash, label, diffs, now);
+                    } else {
+                        self.director.pin(hash, label, diffs, now);
+                    }
                 }
                 _ => {}
             }
             self.director.apply(&event, now);
+            // A new edit matters more than history: stop and show it.
+            if matches!(event, SessionEvent::Changed(_)) && self.playback.is_some() {
+                self.stop_playback(now);
+            }
             changed = true;
         }
         changed
@@ -213,13 +253,102 @@ impl App {
         self.sidebar = Some(!self.sidebar_open());
     }
 
+    /// Starts playback at the selected commit (or `playback_commits` back)
+    /// and plays forward to the newest; or stops it if it's running.
+    fn toggle_playback(&mut self, now: Instant) {
+        if self.playback.is_some() {
+            self.stop_playback(now);
+            return;
+        }
+        let selected = self
+            .director
+            .pinned()
+            .and_then(|h| self.commits.iter().position(|c| c.hash == h));
+        let start = selected.unwrap_or(self.playback_commits.min(self.commits.len()).saturating_sub(1));
+        self.play_from(start, now);
+    }
+
+    /// Plays from `commits[start]` up to the newest commit.
+    fn play_from(&mut self, start: usize, now: Instant) {
+        if start >= self.commits.len() {
+            return;
+        }
+        // Playback is hands-off, even if a click just paused auto-follow.
+        self.director.set_following(true, now);
+        let hashes: Vec<String> = self.commits[..=start].iter().rev().map(|c| c.hash.clone()).collect();
+        self.card = None;
+        self.load(&hashes[0]);
+        self.playback = Some(Playback { hashes, index: 0 });
+    }
+
+    /// After a commit's full pass: on to the next, or back to live at the end.
+    fn next_commit(&mut self, now: Instant) {
+        let Some(playback) = &mut self.playback else { return };
+        if self.loading.is_some() || self.card.is_some() {
+            return; // already on the way
+        }
+        if playback.index + 1 >= playback.hashes.len() {
+            self.stop_playback(now);
+            return;
+        }
+        playback.index += 1;
+        let hash = playback.hashes[playback.index].clone();
+        self.load(&hash);
+    }
+
+    fn stop_playback(&mut self, now: Instant) {
+        self.playback = None;
+        self.card = None;
+        self.loading = None;
+        self.director.unpin(now);
+    }
+
+    fn show_card(&mut self, hash: &str, label: &str, diffs: &[Arc<FileDiff>], now: Instant) {
+        let (Some(playback), Some(commit)) = (&self.playback, self.commits.iter().find(|c| c.hash == hash))
+        else {
+            self.director.play(hash, label, diffs, now);
+            return;
+        };
+        self.card = Some(Card {
+            commit: commit.clone(),
+            position: (playback.index + 1, playback.hashes.len()),
+            files: diffs.len(),
+            added: diffs.iter().map(|d| d.added).sum(),
+            removed: diffs.iter().map(|d| d.removed).sum(),
+            until: now + self.director.cycle_dwell(),
+            label: label.to_string(),
+            diffs: diffs.to_vec(),
+        });
+    }
+
+    /// Replaces the title card with its commit once its time is up.
+    fn end_card(&mut self, now: Instant) -> bool {
+        if self.card.as_ref().is_none_or(|c| now < c.until) {
+            return false;
+        }
+        let card = self.card.take().unwrap();
+        self.director.play(&card.commit.hash, &card.label, &card.diffs, now);
+        true
+    }
+
+    fn load(&mut self, hash: &str) {
+        self.loading = Some(hash.to_string());
+        self.session.load_commit(hash);
+    }
+
     /// Shows `hash`'s diff, or returns to live changes if it's already shown.
+    /// During playback, playback restarts from `hash`.
     fn toggle_commit(&mut self, hash: &str, now: Instant) {
+        if self.playback.is_some() {
+            if let Some(i) = self.commits.iter().position(|c| c.hash == hash) {
+                self.play_from(i, now);
+            }
+            return;
+        }
         if self.director.pinned() == Some(hash) {
             self.director.unpin(now);
         } else {
-            self.loading = Some(hash.to_string());
-            self.session.load_commit(hash);
+            self.load(hash);
         }
     }
 
@@ -247,6 +376,7 @@ impl App {
                     Some(Hit::Commit(hash)) => self.toggle_commit(&hash, now),
                     Some(Hit::ToggleLog) => self.log_open = !self.log_open,
                     Some(Hit::LogEdge) => self.dragging_log = true,
+                    Some(Hit::TogglePlayback) => self.toggle_playback(now),
                     None => {}
                 }
             }
@@ -278,7 +408,8 @@ impl App {
         let page = self.viewport.saturating_sub(2).max(1) as isize;
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            // Esc backs out of a commit first.
+            // Esc stops playback or backs out of a commit before quitting.
+            KeyCode::Esc if self.playback.is_some() => self.stop_playback(now),
             KeyCode::Esc if self.loading.is_some() => self.loading = None,
             KeyCode::Esc if self.director.pinned().is_some() => {
                 self.director.unpin(now);
@@ -306,6 +437,7 @@ impl App {
             KeyCode::Char('s') => self.toggle_sidebar(),
             KeyCode::Char('w') => self.wrap = !self.wrap,
             KeyCode::Char('l') => self.log_open = !self.log_open,
+            KeyCode::Char('P') => self.toggle_playback(now),
             KeyCode::Char('{') => self.resize_log(self.log_rows as i32 - 1),
             KeyCode::Char('}') => self.resize_log(self.log_rows as i32 + 1),
             KeyCode::Char('f') => {

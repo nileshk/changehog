@@ -45,6 +45,9 @@ pub struct Config {
     /// Commits visible in the git log panel.
     #[serde(deserialize_with = "log_rows")]
     pub log_rows: u16,
+    /// Commits played back when starting playback with none selected.
+    #[serde(deserialize_with = "playback_commits")]
+    pub playback_commits: u16,
 }
 
 impl Default for Config {
@@ -57,6 +60,7 @@ impl Default for Config {
             sidebar: SidebarMode::Auto,
             log: true,
             log_rows: 5,
+            playback_commits: 10,
         }
     }
 }
@@ -64,6 +68,7 @@ impl Default for Config {
 pub const CYCLE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=600.0;
 pub const RESUME_RANGE: std::ops::RangeInclusive<f32> = 1.0..=3600.0;
 pub const LOG_ROWS_RANGE: std::ops::RangeInclusive<u16> = 1..=50;
+pub const PLAYBACK_RANGE: std::ops::RangeInclusive<u16> = 1..=200;
 
 /// A commented config file with every setting at its default.
 pub const TEMPLATE: &str = r#"# changehog configuration
@@ -92,6 +97,10 @@ log = true
 
 # Commits visible in the git log panel. 1 to 50.
 log_rows = 5
+
+# How many recent commits playback goes through when started with no commit
+# selected (with one selected, it plays from there to the newest). 1 to 200.
+playback_commits = 10
 "#;
 
 impl Config {
@@ -157,17 +166,28 @@ fn resume_after_seconds<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error
     in_range(d, RESUME_RANGE)
 }
 
-fn log_rows<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+fn u16_in_range<'de, D: Deserializer<'de>>(
+    d: D,
+    range: std::ops::RangeInclusive<u16>,
+) -> Result<u16, D::Error> {
     let value = u16::deserialize(d)?;
-    if LOG_ROWS_RANGE.contains(&value) {
+    if range.contains(&value) {
         Ok(value)
     } else {
         Err(serde::de::Error::custom(format!(
             "must be between {} and {}",
-            LOG_ROWS_RANGE.start(),
-            LOG_ROWS_RANGE.end()
+            range.start(),
+            range.end()
         )))
     }
+}
+
+fn log_rows<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+    u16_in_range(d, LOG_ROWS_RANGE)
+}
+
+fn playback_commits<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+    u16_in_range(d, PLAYBACK_RANGE)
 }
 
 #[cfg(test)]

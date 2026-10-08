@@ -82,6 +82,10 @@ pub enum Transition {
     Flip(Flip),
     /// Scrolled within the current file to bring more changes on screen.
     Scroll { from: usize, to: usize },
+    /// A commit pinned with [`Director::play`] has had one full pass: every
+    /// file and scroll step. Nothing moved; it's the caller's cue to go on.
+    /// Repeats each dwell until the caller pins something else.
+    EndOfPass,
 }
 
 /// Where to scroll when a file is shown.
@@ -146,6 +150,8 @@ struct Pinned {
     id: String,
     label: String,
     files: FileSet,
+    /// Report [`Transition::EndOfPass`] instead of cycling back to the start.
+    playback: bool,
 }
 
 pub struct Director {
@@ -298,6 +304,28 @@ impl Director {
     /// [`unpin`]: Director::unpin
     pub fn pin(&mut self, id: &str, label: &str, diffs: &[Arc<FileDiff>], now: Instant) -> Option<Flip> {
         self.user_input(now);
+        self.pin_files(id, label, diffs, false, now)
+    }
+
+    /// Pins a commit for playback: like [`Director::pin`], but auto-follow
+    /// stays on, and after one full pass `tick` reports
+    /// [`Transition::EndOfPass`] instead of starting over.
+    pub fn play(&mut self, id: &str, label: &str, diffs: &[Arc<FileDiff>], now: Instant) -> Option<Flip> {
+        self.following = true;
+        self.last_input = now;
+        self.pin_files(id, label, diffs, true, now)
+    }
+
+    fn pin_files(
+        &mut self,
+        id: &str,
+        label: &str,
+        diffs: &[Arc<FileDiff>],
+        playback: bool,
+        now: Instant,
+    ) -> Option<Flip> {
+        // The dwell for a commit with no files starts now.
+        self.shown_at = now;
         let mut files = FileSet::default();
         for diff in diffs {
             files.insert(diff.clone());
@@ -306,6 +334,7 @@ impl Director {
             id: id.to_string(),
             label: label.to_string(),
             files,
+            playback,
         });
         self.current = None;
         self.relayout();
@@ -353,6 +382,14 @@ impl Director {
             return Some(self.scroll_step(to, now));
         }
         let active = self.active();
+        let at_last = match &self.current {
+            Some(c) => active.order.last() == Some(c),
+            None => active.is_empty(),
+        };
+        if at_last && self.pinned.as_ref().is_some_and(|p| p.playback) {
+            self.shown_at = now;
+            return Some(Transition::EndOfPass);
+        }
         if active.order.len() < 2 && self.current.is_some() {
             // Only one file: start over from its top if we scrolled down.
             return (self.scroll > 0).then(|| self.scroll_step(0, now));
@@ -865,6 +902,38 @@ mod tests {
         assert_eq!((cur(&d), d.pinned()), (Some("new"), None));
         assert!(d.following());
         assert_eq!(d.files().count(), 3);
+    }
+
+    #[test]
+    fn playback_reports_the_end_of_each_pass() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        d.set_viewport(10);
+        let long = shaped("long", &format!("h+{}+", "c".repeat(20)));
+        d.play("c1", "commit c1", &[diff("a"), long], t0);
+        assert!(d.following(), "playback doesn't pause auto-follow");
+        let mut t = t0;
+        let mut step = || {
+            t += secs(4.0);
+            d.tick(t)
+        };
+        assert!(matches!(step(), Some(Transition::Flip(f)) if f.to == "long"));
+        assert!(matches!(step(), Some(Transition::Scroll { .. })), "scroll steps still happen");
+        assert_eq!(step(), Some(Transition::EndOfPass));
+        assert_eq!(step(), Some(Transition::EndOfPass), "repeats each dwell, nothing moves");
+        assert_eq!(cur(&d), Some("long"));
+
+        // An empty commit (e.g. a merge) ends after one dwell.
+        d.play("c2", "commit c2", &[], t);
+        assert_eq!(d.tick(t + secs(1.0)), None);
+        assert_eq!(d.tick(t + secs(4.0)), Some(Transition::EndOfPass));
+
+        // A plain pin still loops.
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        d.pin("c1", "commit c1", &[diff("a"), diff("b")], t0);
+        d.set_following(true, t0);
+        assert!(matches!(d.tick(t0 + secs(4.0)), Some(Transition::Flip(_))));
+        assert!(matches!(d.tick(t0 + secs(8.0)), Some(Transition::Flip(f)) if f.to == "a"));
     }
 
     #[test]

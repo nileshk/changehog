@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
-use crate::app::{App, FRESH_FADE, Hit};
+use crate::app::{App, Card, FRESH_FADE, Hit};
 use crate::wrap;
 
 const SIDEBAR_WIDTH: u16 = 36;
@@ -74,7 +74,17 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         .root()
         .file_name()
         .map_or_else(|| app.session.root().display().to_string(), |n| n.to_string_lossy().into_owned());
-    let base = if let Some(label) = app.director.pinned_label() {
+    let base = if let Some(playback) = &app.playback {
+        let label = match (&app.card, app.director.pinned_label()) {
+            (Some(card), _) => format!("commit {} {}", card.commit.short, card.commit.subject),
+            (None, Some(label)) => label.to_string(),
+            (None, None) => "loading…".to_string(),
+        };
+        Span::styled(
+            format!("▶ {}/{} · {label}  (esc: stop)", playback.index + 1, playback.hashes.len()),
+            Style::new().fg(palette::ACCENT),
+        )
+    } else if let Some(label) = app.director.pinned_label() {
         Span::styled(format!("{label}  (esc: back to live)"), Style::new().fg(palette::ACCENT))
     } else {
         let text = match (app.director.fallback_label(), app.session.mode()) {
@@ -137,6 +147,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ("s", "sidebar"),
         ("w", "wrap"),
         ("l", "log"),
+        ("P", "play"),
         ("q", "quit"),
     ];
     let spans: Vec<Span> = keys
@@ -167,15 +178,27 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
         app.hits.push((title_row, Hit::ToggleLog));
         return;
     }
+    let play = if app.playback.is_some() { "■ stop" } else { "▶ play" };
+    let accent = Style::new().fg(palette::ACCENT).bold();
     block = block.title_top(
-        Line::from(Span::styled("▾ ", Style::new().fg(palette::ACCENT).bold())).right_aligned(),
+        Line::from(vec![Span::styled(play, accent), Span::raw("  "), Span::styled("▾ ", accent)])
+            .right_aligned(),
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    // The ▾ button first, so it wins over the draggable edge it sits on.
+    // Buttons first, so they win over the draggable edge they sit on.
+    let right = area.x + area.width;
     app.hits.push((
         Rect {
-            x: (area.x + area.width).saturating_sub(3),
+            x: right.saturating_sub(10),
+            width: 6.min(area.width),
+            ..title_row
+        },
+        Hit::TogglePlayback,
+    ));
+    app.hits.push((
+        Rect {
+            x: right.saturating_sub(3),
             width: 3.min(area.width),
             ..title_row
         },
@@ -340,7 +363,44 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The title card shown before each commit during playback.
+fn draw_card(frame: &mut Frame, area: Rect, card: &Card) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let c = &card.commit;
+    let (i, n) = card.position;
+    let files = format!("{} file{}", card.files, if card.files == 1 { "" } else { "s" });
+    let lines = vec![
+        Line::styled(format!("▶ {i} of {n}"), Style::new().fg(palette::DIM)),
+        Line::raw(""),
+        Line::styled(c.short.clone(), Style::new().fg(palette::PAUSED)),
+        Line::styled(c.subject.clone(), Style::new().bold()),
+        Line::styled(
+            format!("{} · {}", c.author, relative_age(now - c.time)),
+            Style::new().fg(palette::DIM),
+        ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(files, Style::new().fg(palette::DIM)),
+            Span::styled(format!("  +{}", card.added), Style::new().fg(palette::ADD_FG)),
+            Span::styled(format!(" -{}", card.removed), Style::new().fg(palette::DEL_FG)),
+        ]),
+    ];
+    let height = lines.len() as u16;
+    let [_, mid, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(height),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    frame.render_widget(Paragraph::new(lines).centered(), mid);
+}
+
 fn draw_diff(frame: &mut Frame, area: Rect, app: &mut App) {
+    if let Some(card) = &app.card {
+        return draw_card(frame, area, card);
+    }
     let Some(diff) = app.director.current().cloned() else {
         let msg = format!("Watching {} — waiting for changes…", app.session.root().display());
         let [_, mid, _] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])

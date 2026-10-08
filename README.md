@@ -29,6 +29,12 @@ A git log panel along the bottom lists recent commits, newest first, and
 updates as commits are made. Click one to cycle through its diff instead; new
 edits keep being recorded and are shown when you return to live changes.
 
+Playback (`P`, or `▶ play` on the log panel) steps through recent commits
+oldest first, from the selected commit (or the last 10) up to the newest. Each
+commit gets a title card, then one full pass through its files, then playback
+moves on; after the newest it returns to live changes. A new edit stops
+playback and shows the edit.
+
 ## Configuration
 
 Settings are read from `~/.config/changehog/config.toml` (or
@@ -48,6 +54,7 @@ mkdir -p ~/.config/changehog && changehog --print-config > ~/.config/changehog/c
 | `sidebar` | `"auto"` | `"auto"`, `"open"` or `"closed"` |
 | `log` | `true` | Show the git log panel |
 | `log_rows` | `5` | Commits visible in the log panel (1 to 50) |
+| `playback_commits` | `10` | Commits played back when none is selected (1 to 200) |
 
 Use `--config PATH` to read a different file. Changes made while running
 (speed, sidebar, wrap) aren't saved back to the file.
@@ -56,13 +63,16 @@ Use `--config PATH` to read a different file. Changes made while running
 
 Keys: `j/k` scroll, `d/u` page, `n/p` next/previous file, `f` toggle follow,
 `+/-` cycle faster/slower, `s` toggle the file sidebar, `w` toggle soft wrap,
-`l` toggle the git log panel, `{`/`}` shrink/grow it, `Esc` return from a
-commit to live changes, `q` quit.
+`l` toggle the git log panel, `{`/`}` shrink/grow it, `P` start/stop commit
+playback, `Esc` stop playback or return from a commit to live changes, `q`
+quit.
 
 Mouse: click a file in the sidebar to jump to it, click `«` / `»` to collapse
 or expand the sidebar, and use the wheel to scroll. In the git log panel,
 click a commit to show its diff (click it again to go back), drag the panel's
-top edge to resize it, and click `▾` / `▸` to hide or show it. Since changehog captures
+top edge to resize it, click `▶ play` / `■ stop` for playback, and click
+`▾` / `▸` to hide or show it. Clicking a commit during playback restarts it
+from that commit. Since changehog captures
 the mouse, hold Option (macOS) or Shift (most Linux terminals) to select text.
 
 Any navigation pauses auto-follow; it resumes after 20s idle.
