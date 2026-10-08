@@ -22,6 +22,29 @@ they change. When a file's changes don't fit on screen, scrolling down to the
 next off-screen change is a step in the cycle, at the same interval. Until the session has changes of its own, it shows uncommitted
 changes against HEAD, or if the tree is clean, the last commit.
 
+## Configuration
+
+Settings are read from `~/.config/changehog/config.toml` (or
+`$XDG_CONFIG_HOME/changehog/config.toml`) if it exists, and command-line flags
+override them. To start one with every setting at its default:
+
+```bash
+mkdir -p ~/.config/changehog && changehog --print-config > ~/.config/changehog/config.toml
+```
+
+| Setting | Default | |
+|---|---|---|
+| `cycle_seconds` | `4.0` | Seconds per file or scroll step (0.5 to 600) |
+| `base` | `"session"` | `"session"` or `"head"` |
+| `resume_after_seconds` | `20.0` | Idle time before auto-follow resumes (1 to 3600) |
+| `wrap` | `false` | Wrap long lines |
+| `sidebar` | `"auto"` | `"auto"`, `"open"` or `"closed"` |
+
+Use `--config PATH` to read a different file. Changes made while running
+(speed, sidebar, wrap) aren't saved back to the file.
+
+## Controls
+
 Keys: `j/k` scroll, `d/u` page, `n/p` next/previous file, `f` toggle follow,
 `+/-` cycle faster/slower, `s` toggle the file sidebar, `q` quit.
 

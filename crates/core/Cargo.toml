@@ -8,7 +8,9 @@ authors.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 notify = "8.2.0"
+serde = { version = "1.0.229", features = ["derive"] }
 similar = "3.2.0"
+toml = "1.1.7"
 
 [dev-dependencies]
 tempfile = "3.27.0"

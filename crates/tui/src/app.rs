@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use changehog_core::{Director, DirectorConfig, Session, SessionEvent};
+use changehog_core::{Config, Director, DirectorConfig, Session, SessionEvent, SidebarMode};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -48,9 +48,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(session: Session, cycle: Duration) -> Self {
+    pub fn new(session: Session, config: &Config) -> Self {
         let cfg = DirectorConfig {
-            cycle_dwell: cycle,
+            cycle_dwell: config.cycle(),
+            resume_after: config.resume_after(),
             ..DirectorConfig::default()
         };
         Self {
@@ -60,7 +61,11 @@ impl App {
             viewport: 20,
             shown: None,
             message: None,
-            sidebar: None,
+            sidebar: match config.sidebar {
+                SidebarMode::Auto => None,
+                SidebarMode::Open => Some(true),
+                SidebarMode::Closed => Some(false),
+            },
             body_width: 0,
             hits: Vec::new(),
             quit: false,

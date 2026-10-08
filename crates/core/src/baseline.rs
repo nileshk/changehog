@@ -46,14 +46,16 @@ impl Content {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Deserialize)]
 pub enum BaseMode {
     /// The working tree as it was when the session started. Survives the
     /// agent committing, stashing or resetting mid-session.
     #[default]
+    #[serde(rename = "session")]
     SessionStart,
     /// The HEAD commit as of session start (pinned, so later commits don't
     /// make changes vanish).
+    #[serde(rename = "head")]
     Head,
 }
 
