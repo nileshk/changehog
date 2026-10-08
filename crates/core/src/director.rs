@@ -285,7 +285,7 @@ impl Director {
                 let next = self.active().step_from(None, 0);
                 next.map(|next| self.show(next, now, At::Top))
             }
-            SessionEvent::Log(_) | SessionEvent::Commit { .. } | SessionEvent::Error(_) => None,
+            SessionEvent::Log { .. } | SessionEvent::Commit { .. } | SessionEvent::Error(_) => None,
         }
     }
 

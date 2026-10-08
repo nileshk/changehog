@@ -7,7 +7,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
-use crate::app::{App, Card, FRESH_FADE, Hit};
+use crate::app::{App, Card, FRESH_FADE, FilterField, Hit};
+use changehog_core::{AuthorFilter, LogFilter};
 use crate::wrap;
 
 const SIDEBAR_WIDTH: u16 = 36;
@@ -138,6 +139,22 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    if let Some(input) = &app.input {
+        let what = match input.field {
+            FilterField::Message => "Filter commits by message",
+            FilterField::Author => "Filter commits by author",
+        };
+        frame.render_widget(
+            Line::from(vec![
+                Span::styled(format!(" {what}: "), Style::new().fg(palette::ACCENT)),
+                Span::raw(input.text.clone()),
+                Span::styled("▏", Style::new().fg(palette::ACCENT)),
+                Span::styled("   enter apply · empty clears · esc cancel", Style::new().fg(palette::DIM)),
+            ]),
+            area,
+        );
+        return;
+    }
     let keys = [
         ("j/k", "scroll"),
         ("d/u", "page"),
@@ -148,6 +165,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ("w", "wrap"),
         ("l", "log"),
         ("P", "play"),
+        ("/ a m", "filter"),
         ("q", "quit"),
     ];
     let spans: Vec<Span> = keys
@@ -168,11 +186,26 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
     app.log_area = area;
     let title_row = Rect { height: 1, ..area };
-    let title = if app.log_open { " Log " } else { " ▸ Log " };
+    let label = if app.log_open { " Log " } else { " ▸ Log " };
+    let mut title = vec![Span::styled(label, Style::new().fg(palette::DIM))];
+    if let Some(desc) = describe_filter(&app.log_filter) {
+        let chip = format!(" {desc} ✕ ");
+        // Clicking the filter clears it.
+        let x = area.x + label.chars().count() as u16;
+        app.hits.push((
+            Rect {
+                x,
+                width: (chip.chars().count() as u16).min(area.width.saturating_sub(x - area.x)),
+                ..title_row
+            },
+            Hit::ClearLogFilter,
+        ));
+        title.push(Span::styled(chip, Style::new().fg(Color::Black).bg(palette::PAUSED)));
+    }
     let mut block = Block::new()
         .borders(Borders::TOP)
         .border_style(Style::new().fg(palette::DIM))
-        .title(Span::styled(title, Style::new().fg(palette::DIM)));
+        .title(Line::from(title));
     if !app.log_open {
         frame.render_widget(block, area);
         app.hits.push((title_row, Hit::ToggleLog));
@@ -180,14 +213,30 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     let play = if app.playback.is_some() { "■ stop" } else { "▶ play" };
     let accent = Style::new().fg(palette::ACCENT).bold();
+    let mine = matches!(app.log_filter.author, Some(AuthorFilter::Me));
+    let me_style = if mine { accent } else { Style::new().fg(palette::DIM) };
     block = block.title_top(
-        Line::from(vec![Span::styled(play, accent), Span::raw("  "), Span::styled("▾ ", accent)])
-            .right_aligned(),
+        Line::from(vec![
+            Span::styled("me", me_style),
+            Span::raw("  "),
+            Span::styled(play, accent),
+            Span::raw("  "),
+            Span::styled("▾ ", accent),
+        ])
+        .right_aligned(),
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // Buttons first, so they win over the draggable edge they sit on.
     let right = area.x + area.width;
+    app.hits.push((
+        Rect {
+            x: right.saturating_sub(14),
+            width: 2.min(area.width),
+            ..title_row
+        },
+        Hit::ToggleMine,
+    ));
     app.hits.push((
         Rect {
             x: right.saturating_sub(10),
@@ -207,10 +256,8 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
     app.hits.push((title_row, Hit::LogEdge));
 
     if app.commits.is_empty() {
-        frame.render_widget(
-            Line::styled(" No commits yet", Style::new().fg(palette::DIM)),
-            inner,
-        );
+        let msg = if app.log_filter.is_empty() { " No commits yet" } else { " No matching commits" };
+        frame.render_widget(Line::styled(msg, Style::new().fg(palette::DIM)), inner);
         return;
     }
     let now = std::time::SystemTime::now()
@@ -257,6 +304,20 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &mut App) {
         .style(style);
         frame.render_widget(line, rect);
     }
+}
+
+/// `message "fix" · by me`, or `None` with no filter.
+fn describe_filter(filter: &LogFilter) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(m) = &filter.message {
+        parts.push(format!("message “{m}”"));
+    }
+    match &filter.author {
+        Some(AuthorFilter::Me) => parts.push("by me".into()),
+        Some(AuthorFilter::Matching(a)) => parts.push(format!("author “{a}”")),
+        None => {}
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// "now", "5m ago", "3h ago", "2d ago", "4mo ago", "1y ago".

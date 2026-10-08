@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use changehog_core::config::LOG_ROWS_RANGE;
 use changehog_core::{
-    Commit, Config, Director, DirectorConfig, FileDiff, Measure, Session, SessionEvent,
-    SidebarMode, Transition,
+    AuthorFilter, Commit, Config, Director, DirectorConfig, FileDiff, LogFilter, Measure,
+    Session, SessionEvent, SidebarMode, Transition,
 };
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -34,6 +34,21 @@ pub enum Hit {
     /// The log panel's top edge, which resizes it when dragged.
     LogEdge,
     TogglePlayback,
+    /// Toggles showing only my commits.
+    ToggleMine,
+    ClearLogFilter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterField {
+    Message,
+    Author,
+}
+
+/// A log filter being typed.
+pub struct FilterInput {
+    pub field: FilterField,
+    pub text: String,
 }
 
 /// Playing back commits, oldest first, one full pass each.
@@ -92,6 +107,8 @@ pub struct App {
     dragging_log: bool,
     pub playback: Option<Playback>,
     pub card: Option<Card>,
+    pub log_filter: LogFilter,
+    pub input: Option<FilterInput>,
     playback_commits: usize,
     quit: bool,
 }
@@ -128,6 +145,8 @@ impl App {
             dragging_log: false,
             playback: None,
             card: None,
+            log_filter: LogFilter::default(),
+            input: None,
             playback_commits: config.playback_commits as usize,
             quit: false,
         }
@@ -177,7 +196,8 @@ impl App {
                     }
                     self.message = Some((e.clone(), now));
                 }
-                SessionEvent::Log(commits) => {
+                // Results for a filter no longer wanted are ignored.
+                SessionEvent::Log { filter, commits } if *filter == self.log_filter => {
                     self.commits = commits.clone();
                     self.log_offset = self.log_offset.min(self.commits.len().saturating_sub(1));
                 }
@@ -352,6 +372,64 @@ impl App {
         }
     }
 
+    fn set_log_filter(&mut self, filter: LogFilter) {
+        self.log_filter = filter.clone();
+        self.log_offset = 0;
+        self.session.set_log_filter(filter);
+    }
+
+    fn toggle_mine(&mut self) {
+        let mut filter = self.log_filter.clone();
+        filter.author = match filter.author {
+            Some(AuthorFilter::Me) => None,
+            _ => Some(AuthorFilter::Me),
+        };
+        self.log_open = true;
+        self.set_log_filter(filter);
+    }
+
+    /// Starts typing a filter, beginning with its current value.
+    fn edit_filter(&mut self, field: FilterField) {
+        let text = match field {
+            FilterField::Message => self.log_filter.message.clone(),
+            FilterField::Author => match &self.log_filter.author {
+                Some(AuthorFilter::Matching(a)) => Some(a.clone()),
+                _ => None,
+            },
+        };
+        self.log_open = true;
+        self.input = Some(FilterInput {
+            field,
+            text: text.unwrap_or_default(),
+        });
+    }
+
+    /// Keys while typing a filter: Enter applies (empty clears that
+    /// filter), Esc cancels.
+    fn on_input_key(&mut self, key: KeyEvent) {
+        let Some(input) = &mut self.input else { return };
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+            KeyCode::Char(c) => input.text.push(c),
+            KeyCode::Backspace => {
+                input.text.pop();
+            }
+            KeyCode::Esc => self.input = None,
+            KeyCode::Enter => {
+                let input = self.input.take().unwrap();
+                let text = input.text.trim().to_string();
+                let text = (!text.is_empty()).then_some(text);
+                let mut filter = self.log_filter.clone();
+                match input.field {
+                    FilterField::Message => filter.message = text,
+                    FilterField::Author => filter.author = text.map(AuthorFilter::Matching),
+                }
+                self.set_log_filter(filter);
+            }
+            _ => {}
+        }
+    }
+
     fn resize_log(&mut self, rows: i32) {
         let (min, max) = (*LOG_ROWS_RANGE.start() as i32, *LOG_ROWS_RANGE.end() as i32);
         self.log_rows = rows.clamp(min, max) as u16;
@@ -377,6 +455,8 @@ impl App {
                     Some(Hit::ToggleLog) => self.log_open = !self.log_open,
                     Some(Hit::LogEdge) => self.dragging_log = true,
                     Some(Hit::TogglePlayback) => self.toggle_playback(now),
+                    Some(Hit::ToggleMine) => self.toggle_mine(),
+                    Some(Hit::ClearLogFilter) => self.set_log_filter(LogFilter::default()),
                     None => {}
                 }
             }
@@ -403,6 +483,9 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
+        }
+        if self.input.is_some() {
+            return self.on_input_key(key);
         }
         let now = Instant::now();
         let page = self.viewport.saturating_sub(2).max(1) as isize;
@@ -438,6 +521,9 @@ impl App {
             KeyCode::Char('w') => self.wrap = !self.wrap,
             KeyCode::Char('l') => self.log_open = !self.log_open,
             KeyCode::Char('P') => self.toggle_playback(now),
+            KeyCode::Char('/') => self.edit_filter(FilterField::Message),
+            KeyCode::Char('a') => self.edit_filter(FilterField::Author),
+            KeyCode::Char('m') => self.toggle_mine(),
             KeyCode::Char('{') => self.resize_log(self.log_rows as i32 - 1),
             KeyCode::Char('}') => self.resize_log(self.log_rows as i32 + 1),
             KeyCode::Char('f') => {

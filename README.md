@@ -35,6 +35,11 @@ commit gets a title card, then one full pass through its files, then playback
 moves on; after the newest it returns to live changes. A new edit stops
 playback and shows the edit.
 
+The log can be filtered by message (`/`) or author (`a`), or to just your own
+commits (`m`, or `me` on the log panel), which uses your git `user.email`.
+Filters search the whole history, ignore case, and match text literally;
+playback goes through the filtered commits.
+
 ## Configuration
 
 Settings are read from `~/.config/changehog/config.toml` (or
@@ -63,17 +68,19 @@ Use `--config PATH` to read a different file. Changes made while running
 
 Keys: `j/k` scroll, `d/u` page, `n/p` next/previous file, `f` toggle follow,
 `+/-` cycle faster/slower, `s` toggle the file sidebar, `w` toggle soft wrap,
-`l` toggle the git log panel, `{`/`}` shrink/grow it, `P` start/stop commit
+`l` toggle the git log panel, `{`/`}` shrink/grow it, `/` filter it by
+message, `a` by author, `m` toggle only my commits, `P` start/stop commit
 playback, `Esc` stop playback or return from a commit to live changes, `q`
 quit.
 
 Mouse: click a file in the sidebar to jump to it, click `«` / `»` to collapse
 or expand the sidebar, and use the wheel to scroll. In the git log panel,
 click a commit to show its diff (click it again to go back), drag the panel's
-top edge to resize it, click `▶ play` / `■ stop` for playback, and click
-`▾` / `▸` to hide or show it. Clicking a commit during playback restarts it
-from that commit. Since changehog captures
-the mouse, hold Option (macOS) or Shift (most Linux terminals) to select text.
+top edge to resize it, click `▶ play` / `■ stop` for playback, `me` to show
+only your commits, the filter label to clear the filter, and `▾` / `▸` to hide
+or show it. Clicking a commit during playback restarts it from that commit.
+Since changehog captures the mouse, hold Option (macOS) or Shift (most Linux
+terminals) to select text.
 
 Any navigation pauses auto-follow; it resumes after 20s idle.
 

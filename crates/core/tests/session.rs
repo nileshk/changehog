@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use changehog_core::{BaseMode, FileStatus, Session, SessionEvent};
+use changehog_core::{AuthorFilter, BaseMode, FileStatus, LogFilter, Session, SessionEvent};
 
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -36,7 +36,7 @@ fn next(session: &Session) -> SessionEvent {
 fn next_change(session: &Session) -> SessionEvent {
     loop {
         match next(session) {
-            SessionEvent::Fallback { .. } | SessionEvent::Log(_) => continue,
+            SessionEvent::Fallback { .. } | SessionEvent::Log { .. } => continue,
             other => return other,
         }
     }
@@ -146,7 +146,7 @@ fn fallback_returns_after_last_change_is_reverted() {
 
 fn log(session: &Session) -> Vec<String> {
     loop {
-        if let SessionEvent::Log(commits) = next(session) {
+        if let SessionEvent::Log { commits, .. } = next(session) {
             return commits.iter().map(|c| c.subject.clone()).collect();
         }
     }
@@ -177,7 +177,7 @@ fn load_commit_diffs_against_its_parent() {
 
     let session = Session::start(dir.path(), BaseMode::SessionStart).unwrap();
     let hashes: Vec<String> = loop {
-        if let SessionEvent::Log(commits) = next(&session) {
+        if let SessionEvent::Log { commits, .. } = next(&session) {
             break commits.iter().map(|c| c.hash.clone()).collect();
         }
     };
@@ -205,4 +205,48 @@ fn load_commit_diffs_against_its_parent() {
     let summary: Vec<_> = diffs.iter().map(|d| (d.path.as_str(), d.added, d.removed)).collect();
     assert_eq!(summary, [("a.txt", 1, 1), ("b.txt", 1, 0)]);
     assert!(diffs.iter().all(|d| d.lines().iter().all(|l| !l.fresh)));
+}
+
+fn commit_as(dir: &Path, name: &str, message: &str) {
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(["-c", &format!("user.name={name}"), "-c", &format!("user.email={name}@example.com")])
+        .args(["-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", message])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn log_filters_by_message_author_and_me() {
+    let dir = repo();
+    commit_as(dir.path(), "alice", "Fix the parser");
+    commit_as(dir.path(), "bob", "fix typo in README");
+    commit_as(dir.path(), "alice", "Add feature");
+    git(dir.path(), &["config", "user.email", "bob@example.com"]);
+
+    let session = Session::start(dir.path(), BaseMode::SessionStart).unwrap();
+    assert_eq!(log(&session).len(), 4);
+
+    let filtered = |filter: LogFilter| {
+        session.set_log_filter(filter.clone());
+        loop {
+            if let SessionEvent::Log { filter: f, commits } = next(&session)
+                && f == filter
+            {
+                return commits.iter().map(|c| c.subject.clone()).collect::<Vec<_>>();
+            }
+        }
+    };
+    let message = |m: &str| Some(m.to_string());
+    let author = |a: &str| Some(AuthorFilter::Matching(a.to_string()));
+
+    // Case-insensitive, and literal: "." isn't a wildcard.
+    assert_eq!(filtered(LogFilter { message: message("FIX"), author: None }), ["fix typo in README", "Fix the parser"]);
+    assert!(filtered(LogFilter { message: message("f.x"), author: None }).is_empty());
+    assert_eq!(filtered(LogFilter { message: None, author: author("ALICE") }), ["Add feature", "Fix the parser"]);
+    assert_eq!(filtered(LogFilter { message: None, author: Some(AuthorFilter::Me) }), ["fix typo in README"]);
+    // Both must match.
+    assert_eq!(filtered(LogFilter { message: message("fix"), author: author("alice") }), ["Fix the parser"]);
+    assert_eq!(filtered(LogFilter::default()).len(), 4);
 }

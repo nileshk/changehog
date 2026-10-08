@@ -24,6 +24,29 @@ pub struct Commit {
     pub subject: String,
 }
 
+/// Narrows `git log`. Matching is case-insensitive and literal (not regex).
+/// With both set, a commit must match both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogFilter {
+    /// Text in the commit message.
+    pub message: Option<String>,
+    pub author: Option<AuthorFilter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthorFilter {
+    /// The configured `user.email` (or `user.name` if there's no email).
+    Me,
+    /// Text in the author's name or email.
+    Matching(String),
+}
+
+impl LogFilter {
+    pub fn is_empty(&self) -> bool {
+        self.message.is_none() && self.author.is_none()
+    }
+}
+
 pub struct Git {
     root: PathBuf,
     cat_file: Mutex<Option<CatFile>>,
@@ -87,13 +110,40 @@ impl Git {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    /// The newest `limit` commits reachable from HEAD, newest first. Empty
-    /// on an unborn branch.
-    pub fn log(&self, limit: usize) -> Result<Vec<Commit>> {
-        let out = self
-            .cmd()
-            .args(["log", "-n", &limit.to_string(), "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s"])
-            .output()?;
+    /// The configured identity for "my commits": `user.email`, or
+    /// `user.name` if no email is set.
+    pub fn user_identity(&self) -> Result<String> {
+        for key in ["user.email", "user.name"] {
+            let out = self.cmd().args(["config", "--get", key]).output()?;
+            let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if out.status.success() && !value.is_empty() {
+                return Ok(value);
+            }
+        }
+        bail!("no git user.email or user.name is configured")
+    }
+
+    /// The newest `limit` commits reachable from HEAD that match `filter`,
+    /// newest first. Empty on an unborn branch.
+    pub fn log(&self, limit: usize, filter: &LogFilter) -> Result<Vec<Commit>> {
+        let mut cmd = self.cmd();
+        cmd.args(["log", "-n", &limit.to_string(), "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s"]);
+        if !filter.is_empty() {
+            cmd.args(["--regexp-ignore-case", "--fixed-strings"]);
+        }
+        if let Some(message) = &filter.message {
+            cmd.arg(format!("--grep={message}"));
+        }
+        match &filter.author {
+            Some(AuthorFilter::Me) => {
+                cmd.arg(format!("--author={}", self.user_identity()?));
+            }
+            Some(AuthorFilter::Matching(author)) => {
+                cmd.arg(format!("--author={author}"));
+            }
+            None => {}
+        }
+        let out = cmd.output()?;
         if !out.status.success() {
             return Ok(Vec::new()); // no commits yet
         }

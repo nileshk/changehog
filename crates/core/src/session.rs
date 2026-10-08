@@ -11,7 +11,7 @@ use notify::RecommendedWatcher;
 
 use crate::baseline::{BaseMode, Baseline, Content};
 use crate::diff::{self, FileDiff};
-use crate::git::{Commit, Git};
+use crate::git::{Commit, Git, LogFilter};
 use crate::timeline::{Change, Timeline};
 use crate::watch::{self, Batches};
 
@@ -28,9 +28,12 @@ pub enum SessionEvent {
         label: String,
         diffs: Vec<Arc<FileDiff>>,
     },
-    /// The newest commits, newest first. Sent at startup and whenever refs
-    /// change.
-    Log(Arc<Vec<Commit>>),
+    /// The newest commits matching `filter`, newest first. Sent at startup,
+    /// whenever refs change, and after [`Session::set_log_filter`].
+    Log {
+        filter: LogFilter,
+        commits: Arc<Vec<Commit>>,
+    },
     /// A commit's diff against its first parent, as requested with
     /// [`Session::load_commit`].
     Commit {
@@ -50,6 +53,7 @@ pub struct Session {
     git: Arc<Git>,
     tx: Sender<SessionEvent>,
     events: Receiver<SessionEvent>,
+    log_filter: Arc<Mutex<LogFilter>>,
     timeline: Arc<Mutex<Timeline>>,
     _watcher: RecommendedWatcher,
 }
@@ -64,6 +68,7 @@ impl Session {
         let (baseline, dirty) = Baseline::capture(&git, mode)?;
         let timeline = Arc::new(Mutex::new(Timeline::default()));
         let (tx, events) = mpsc::channel();
+        let log_filter = Arc::new(Mutex::new(LogFilter::default()));
 
         let mut worker = Worker {
             git: git.clone(),
@@ -75,6 +80,7 @@ impl Session {
             seq: 0,
             last_fallback: None,
             last_log: None,
+            log_filter: log_filter.clone(),
         };
         std::thread::Builder::new()
             .name("changehog-session".into())
@@ -86,6 +92,7 @@ impl Session {
             git,
             tx,
             events,
+            log_filter,
             timeline,
             _watcher: watcher,
         })
@@ -105,6 +112,22 @@ impl Session {
 
     pub fn timeline(&self) -> &Arc<Mutex<Timeline>> {
         &self.timeline
+    }
+
+    /// Narrows the log. The filtered log is fetched in the background and
+    /// arrives as a [`SessionEvent::Log`]; later refreshes keep the filter.
+    pub fn set_log_filter(&self, filter: LogFilter) {
+        *self.log_filter.lock().unwrap() = filter.clone();
+        let (git, tx) = (self.git.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(match git.log(LOG_LIMIT, &filter) {
+                Ok(commits) => SessionEvent::Log {
+                    filter,
+                    commits: Arc::new(commits),
+                },
+                Err(e) => SessionEvent::Error(format!("git log: {e}")),
+            });
+        });
     }
 
     /// Loads `hash`'s diff in the background; it arrives as a
@@ -154,7 +177,8 @@ struct Worker {
     /// Label and file stats of the last fallback sent, to skip resending it.
     last_fallback: Option<FallbackSignature>,
     /// Hashes in the last log sent, to skip resending it.
-    last_log: Option<Vec<String>>,
+    last_log: Option<(LogFilter, Vec<String>)>,
+    log_filter: Arc<Mutex<LogFilter>>,
 }
 
 /// A fallback's label plus (path, added, removed) per file.
@@ -235,16 +259,20 @@ impl Worker {
 
     /// Sends the log if it changed.
     fn refresh_log(&mut self) -> Result<(), Disconnected> {
-        let commits = match self.git.log(LOG_LIMIT) {
+        let filter = self.log_filter.lock().unwrap().clone();
+        let commits = match self.git.log(LOG_LIMIT, &filter) {
             Ok(commits) => commits,
             Err(e) => return self.send(SessionEvent::Error(format!("git log: {e}"))),
         };
-        let hashes: Vec<String> = commits.iter().map(|c| c.hash.clone()).collect();
-        if self.last_log.as_ref() == Some(&hashes) {
+        let key = (filter.clone(), commits.iter().map(|c| c.hash.clone()).collect());
+        if self.last_log.as_ref() == Some(&key) {
             return Ok(());
         }
-        self.last_log = Some(hashes);
-        self.send(SessionEvent::Log(Arc::new(commits)))
+        self.last_log = Some(key);
+        self.send(SessionEvent::Log {
+            filter,
+            commits: Arc::new(commits),
+        })
     }
 
     /// Uncommitted changes against HEAD if there are any, otherwise the
