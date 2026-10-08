@@ -6,6 +6,8 @@ A live, auto-following diff viewer for watching coding agents (Claude Code,
 etc.) work. Run it in a split pane next to the agent: it shows what changed,
 scrolls to the latest edit, and flips between files as they change.
 
+<img width="1272" height="667" alt="diff-live-2026-10-07-short" src="https://github.com/user-attachments/assets/193831fc-de86-4e8e-857f-b6e08b5e1fa3" />
+
 ```bash
 cargo run --release -- [PATH] [--base session|head]
 ```
