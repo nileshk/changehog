@@ -181,6 +181,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &mut App) {
             mid,
         );
         app.viewport = area.height as usize;
+        app.director.set_viewport(app.viewport);
         return;
     };
 
@@ -200,6 +201,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.viewport = inner.height as usize;
+    app.director.set_viewport(app.viewport);
 
     let lines = match &diff.body {
         Body::Text(lines) => lines,

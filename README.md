@@ -14,7 +14,8 @@ cargo run --release -- [PATH] [--base session|head]
 - `--cycle SECONDS`: how long to show each file when cycling (default 4).
 
 It cycles through the changed files continuously, jumping ahead to files as
-they change. Until the session has changes of its own, it shows uncommitted
+they change. When a file's changes don't fit on screen, scrolling down to the
+next off-screen change is a step in the cycle, at the same interval. Until the session has changes of its own, it shows uncommitted
 changes against HEAD, or if the tree is clean, the last commit.
 
 Keys: `j/k` scroll, `d/u` page, `n/p` next/previous file, `f` toggle follow,

@@ -12,5 +12,5 @@ pub mod watch;
 
 pub use baseline::{BaseMode, Content};
 pub use diff::{Body, DiffLine, FileDiff, FileStatus, LineKind};
-pub use director::{CYCLE_STEPS, Director, DirectorConfig, Flip};
+pub use director::{CYCLE_STEPS, Director, DirectorConfig, Flip, Transition};
 pub use session::{Session, SessionEvent};

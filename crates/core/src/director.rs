@@ -3,8 +3,14 @@
 //! Agents edit in bursts, so changed files are queued and shown one at a time
 //! with a minimum dwell. The dwell shrinks as the backlog grows, so playback
 //! catches up instead of falling ever further behind. With nothing queued it
-//! keeps cycling through all changed files. Any user navigation pauses
-//! auto-follow; it resumes after a period of inactivity.
+//! keeps cycling through all changed files. When a file's changes don't fit
+//! in the viewport, scrolling down to the next off-screen change is a cycle
+//! step of its own, before moving on to the next file. Any user navigation
+//! pauses auto-follow; it resumes after a period of inactivity.
+//!
+//! The director owns the scroll position (in diff lines) so that frontends
+//! only need to report their viewport height and animate toward
+//! [`Director::scroll`].
 //!
 //! When the session has no changes of its own, the director shows the
 //! session's fallback diffs instead (e.g. the last commit).
@@ -15,7 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::diff::FileDiff;
+use crate::diff::{DiffLine, FileDiff, LineKind};
 use crate::session::SessionEvent;
 
 #[derive(Clone, Debug)]
@@ -64,6 +70,27 @@ pub struct Flip {
     pub from: Option<String>,
     pub to: String,
 }
+
+/// One step of auto-follow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Transition {
+    /// Moved to another file.
+    Flip(Flip),
+    /// Scrolled within the current file to bring more changes on screen.
+    Scroll { from: usize, to: usize },
+}
+
+/// Where to scroll when a file is shown.
+#[derive(Clone, Copy)]
+enum At {
+    /// The most interesting change (the latest edit, if any).
+    Focus,
+    /// The first hunk.
+    Top,
+}
+
+/// Lines of context kept above a change when scrolling to it.
+const SCROLL_MARGIN: usize = 4;
 
 /// Diffs keyed by path, plus their display order.
 #[derive(Default)]
@@ -122,6 +149,9 @@ pub struct Director {
     hold_until: Instant,
     following: bool,
     last_input: Instant,
+    /// Top line of the view, and the view's height, in diff lines.
+    scroll: usize,
+    viewport: usize,
 }
 
 impl Director {
@@ -137,6 +167,8 @@ impl Director {
             hold_until: now,
             following: true,
             last_input: now,
+            scroll: 0,
+            viewport: 20,
         }
     }
 
@@ -158,12 +190,17 @@ impl Director {
                 let showing_live = self.current.as_ref().is_some_and(|c| self.live.contains(c));
                 if !showing_live {
                     // Nothing shown, or only the fallback: jump straight to it.
-                    return Some(self.show(path, now));
+                    return Some(self.show(path, now, At::Focus));
                 }
                 if self.current.as_ref() == Some(&path) {
                     // Keep the file up while it's being actively edited, but
                     // not forever if others are waiting.
                     self.shown_at = now.min(self.hold_until);
+                    self.scroll = if self.following {
+                        self.focus_scroll()
+                    } else {
+                        self.clamp_scroll(self.scroll)
+                    };
                 } else if !self.queue.contains(&path) {
                     self.queue.push_back(path);
                 }
@@ -175,7 +212,7 @@ impl Director {
                 if self.current.as_ref() == Some(path) {
                     self.current = None;
                     let next = self.queue.pop_front().or_else(|| self.active().step_from(None, 0));
-                    return next.map(|next| self.show(next, now));
+                    return next.map(|next| self.show(next, now, At::Focus));
                 }
                 None
             }
@@ -194,31 +231,86 @@ impl Director {
                 }
                 self.current = None;
                 let next = self.active().step_from(None, 0);
-                next.map(|next| self.show(next, now))
+                next.map(|next| self.show(next, now, At::Top))
             }
             SessionEvent::Error(_) => None,
         }
     }
 
-    /// Advances time. Returns a flip when it's time to move to the next file.
-    pub fn tick(&mut self, now: Instant) -> Option<Flip> {
+    /// Advances time. Returns a transition when it's time for the next step:
+    /// a queued file, the next off-screen change in this file, or the next
+    /// file in the cycle.
+    pub fn tick(&mut self, now: Instant) -> Option<Transition> {
         if !self.following && now.duration_since(self.last_input) >= self.cfg.resume_after {
             self.following = true;
         }
         if !self.following || now.duration_since(self.shown_at) < self.current_dwell() {
             return None;
         }
-        let next = match self.queue.pop_front() {
-            Some(next) => next,
-            None => {
-                let active = self.active();
-                if active.order.len() < 2 && self.current.is_some() {
-                    return None;
-                }
-                active.step_from(self.current.as_deref(), 1)?
-            }
-        };
-        Some(self.show(next, now))
+        if let Some(next) = self.queue.pop_front() {
+            return Some(Transition::Flip(self.show(next, now, At::Focus)));
+        }
+        if let Some(to) = self.next_stop() {
+            return Some(self.scroll_step(to, now));
+        }
+        let active = self.active();
+        if active.order.len() < 2 && self.current.is_some() {
+            // Only one file: start over from its top if we scrolled down.
+            return (self.scroll > 0).then(|| self.scroll_step(0, now));
+        }
+        let next = active.step_from(self.current.as_deref(), 1)?;
+        Some(Transition::Flip(self.show(next, now, At::Top)))
+    }
+
+    fn scroll_step(&mut self, to: usize, now: Instant) -> Transition {
+        let from = std::mem::replace(&mut self.scroll, to);
+        self.shown_at = now;
+        Transition::Scroll { from, to }
+    }
+
+    /// Scroll position that brings the first change below the viewport on
+    /// screen, if there is one.
+    fn next_stop(&self) -> Option<usize> {
+        let bottom = self.scroll + self.viewport;
+        let (idx, _) = self
+            .lines()
+            .iter()
+            .enumerate()
+            .skip(bottom)
+            .find(|(_, l)| matches!(l.kind, LineKind::Added | LineKind::Removed))?;
+        let margin = SCROLL_MARGIN.min(self.viewport / 4);
+        Some(self.clamp_scroll(idx.saturating_sub(margin).max(self.scroll + 1)))
+    }
+
+    fn lines(&self) -> &[DiffLine] {
+        self.current().map_or(&[], |d| d.lines())
+    }
+
+    fn clamp_scroll(&self, scroll: usize) -> usize {
+        scroll.min(self.lines().len().saturating_sub(self.viewport))
+    }
+
+    /// Puts the current file's focus line a third of the way down the view.
+    fn focus_scroll(&self) -> usize {
+        let focus = self.current().and_then(|d| d.focus).unwrap_or(0);
+        self.clamp_scroll(focus.saturating_sub(self.viewport / 3))
+    }
+
+    /// The top line of the view, in diff lines.
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    /// Tells the director how many diff lines fit on screen.
+    pub fn set_viewport(&mut self, lines: usize) {
+        self.viewport = lines.max(1);
+        self.scroll = self.clamp_scroll(self.scroll);
+    }
+
+    /// Manually scrolls by `delta` lines. Pauses auto-follow.
+    pub fn scroll_by(&mut self, delta: isize, now: Instant) {
+        self.user_input(now);
+        self.scroll = self.clamp_scroll(self.scroll.saturating_add_signed(delta));
     }
 
     fn current_dwell(&self) -> Duration {
@@ -249,14 +341,16 @@ impl Director {
         *next
     }
 
-    fn show(&mut self, path: String, now: Instant) -> Flip {
+    fn show(&mut self, path: String, now: Instant, at: At) -> Flip {
         self.queue.retain(|p| p != &path);
         self.shown_at = now;
         self.hold_until = now + self.cfg.max_hold;
-        Flip {
-            from: self.current.replace(path.clone()),
-            to: path,
-        }
+        let from = self.current.replace(path.clone());
+        self.scroll = match at {
+            At::Focus => self.focus_scroll(),
+            At::Top => 0,
+        };
+        Flip { from, to: path }
     }
 
     /// Manually moves `delta` files through the list (wrapping). Pauses
@@ -264,7 +358,7 @@ impl Director {
     pub fn step(&mut self, delta: isize, now: Instant) -> Option<Flip> {
         self.user_input(now);
         let next = self.active().step_from(self.current.as_deref(), delta)?;
-        Some(self.show(next, now))
+        Some(self.show(next, now, At::Focus))
     }
 
     /// Records user activity, pausing auto-follow.
@@ -277,7 +371,9 @@ impl Director {
         self.following = following;
         self.last_input = now;
         if following {
-            // Let the next tick flip immediately if anything is waiting.
+            // Back to the latest change; let the next tick flip immediately
+            // if anything is waiting.
+            self.scroll = self.focus_scroll();
             self.shown_at = now.checked_sub(self.cfg.dwell).unwrap_or(now);
         }
     }
@@ -327,6 +423,36 @@ mod tests {
     use super::*;
     use crate::diff::{Body, FileStatus};
 
+    /// A diff whose lines follow `shape`: `h` hunk header, `c` context,
+    /// `+` added, `-` removed.
+    fn shaped(path: &str, shape: &str) -> Arc<FileDiff> {
+        let lines = shape
+            .chars()
+            .map(|c| DiffLine {
+                kind: match c {
+                    'h' => LineKind::HunkHeader,
+                    '+' => LineKind::Added,
+                    '-' => LineKind::Removed,
+                    _ => LineKind::Context,
+                },
+                old_no: None,
+                new_no: None,
+                text: String::new(),
+                fresh: false,
+            })
+            .collect();
+        Arc::new(FileDiff {
+            path: path.into(),
+            status: FileStatus::Modified,
+            added: 1,
+            removed: 0,
+            body: Body::Text(lines),
+            focus: Some(1),
+            seq: 0,
+            at: Instant::now(),
+        })
+    }
+
     fn diff(path: &str) -> Arc<FileDiff> {
         Arc::new(FileDiff {
             path: path.into(),
@@ -370,7 +496,7 @@ mod tests {
 
         assert!(d.tick(t0 + secs(0.5)).is_none());
         let flip = d.tick(t0 + secs(3.0)).unwrap();
-        assert_eq!(flip, Flip { from: Some("a".into()), to: "b".into() });
+        assert_eq!(flip, Transition::Flip(Flip { from: Some("a".into()), to: "b".into() }));
     }
 
     #[test]
@@ -422,6 +548,53 @@ mod tests {
             d.apply(&changed(p), t0);
         }
         assert!(d.tick(t0 + secs(1.0)).is_some());
+    }
+
+    #[test]
+    fn scrolls_to_offscreen_changes_before_flipping() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        d.set_viewport(10);
+        // Changes at 1, 15 and 32; 40 lines in all.
+        let shape = format!("h+{}+{}+{}", "c".repeat(13), "c".repeat(16), "c".repeat(7));
+        d.apply(&SessionEvent::Changed(shaped("long", &shape)), t0);
+        d.apply(&changed("short"), t0);
+        d.tick(t0 + secs(3.0)); // queued "short" first
+        assert_eq!(cur(&d), Some("short"));
+
+        let mut t = t0 + secs(3.0);
+        let mut step = || {
+            t += secs(4.0);
+            d.tick(t).unwrap()
+        };
+        assert!(matches!(step(), Transition::Flip(f) if f.to == "long"));
+        assert_eq!(step(), Transition::Scroll { from: 0, to: 13 }, "line 15, 2 lines of margin");
+        assert_eq!(step(), Transition::Scroll { from: 13, to: 30 }, "clamped to the end");
+        assert!(matches!(step(), Transition::Flip(f) if f.to == "short"));
+    }
+
+    #[test]
+    fn single_long_file_scrolls_then_wraps() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        d.set_viewport(10);
+        d.apply(&SessionEvent::Changed(shaped("long", &format!("h+{}+", "c".repeat(20)))), t0);
+        assert_eq!(d.scroll(), 0);
+        assert!(matches!(d.tick(t0 + secs(4.0)), Some(Transition::Scroll { to: 13, .. })));
+        assert_eq!(d.tick(t0 + secs(8.0)), Some(Transition::Scroll { from: 13, to: 0 }));
+    }
+
+    #[test]
+    fn manual_scroll_pauses_and_clamps() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        d.set_viewport(10);
+        d.apply(&SessionEvent::Changed(shaped("long", &"+".repeat(25))), t0);
+        d.scroll_by(100, t0);
+        assert_eq!(d.scroll(), 15);
+        assert!(!d.following());
+        d.scroll_by(-100, t0);
+        assert_eq!(d.scroll(), 0);
     }
 
     #[test]
