@@ -361,6 +361,16 @@ impl Director {
         Some(self.show(next, now, At::Focus))
     }
 
+    /// Manually shows `path`, if it's in the displayed set. Pauses
+    /// auto-follow.
+    pub fn select(&mut self, path: &str, now: Instant) -> Option<Flip> {
+        self.user_input(now);
+        if !self.active().contains(path) {
+            return None;
+        }
+        Some(self.show(path.to_string(), now, At::Focus))
+    }
+
     /// Records user activity, pausing auto-follow.
     pub fn user_input(&mut self, now: Instant) {
         self.following = false;
@@ -595,6 +605,20 @@ mod tests {
         assert!(!d.following());
         d.scroll_by(-100, t0);
         assert_eq!(d.scroll(), 0);
+    }
+
+    #[test]
+    fn select_jumps_to_a_file_and_pauses() {
+        let t0 = Instant::now();
+        let mut d = Director::new(DirectorConfig::default(), t0);
+        for p in ["a", "b", "c"] {
+            d.apply(&changed(p), t0);
+        }
+        assert_eq!(d.select("c", t0).map(|f| f.to), Some("c".into()));
+        assert_eq!(cur(&d), Some("c"));
+        assert!(!d.following());
+        assert!(d.select("nope", t0).is_none());
+        assert_eq!(cur(&d), Some("c"));
     }
 
     #[test]

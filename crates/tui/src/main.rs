@@ -7,6 +7,8 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use diff_live_core::{BaseMode, Session};
+use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use ratatui::crossterm::execute;
 
 /// Live, auto-following diff viewer for watching coding agents work.
 #[derive(Parser)]
@@ -51,7 +53,16 @@ fn main() -> Result<()> {
     let session = Session::start(&args.path, mode)?;
 
     let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableMouseCapture)?;
+    // ratatui's panic hook restores the terminal; release the mouse too.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        hook(info);
+    }));
+
     let result = app::App::new(session, Duration::from_secs_f32(args.cycle)).run(&mut terminal);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }

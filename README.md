@@ -19,7 +19,13 @@ next off-screen change is a step in the cycle, at the same interval. Until the s
 changes against HEAD, or if the tree is clean, the last commit.
 
 Keys: `j/k` scroll, `d/u` page, `n/p` next/previous file, `f` toggle follow,
-`+/-` cycle faster/slower, `q` quit. Any navigation pauses auto-follow; it resumes after 20s idle.
+`+/-` cycle faster/slower, `s` toggle the file sidebar, `q` quit.
+
+Mouse: click a file in the sidebar to jump to it, click `«` / `»` to collapse
+or expand the sidebar, and use the wheel to scroll. Since diff-live captures
+the mouse, hold Option (macOS) or Shift (most Linux terminals) to select text.
+
+Any navigation pauses auto-follow; it resumes after 20s idle.
 
 ## Layout
 

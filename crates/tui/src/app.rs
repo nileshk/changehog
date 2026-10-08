@@ -3,13 +3,28 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use diff_live_core::{Director, DirectorConfig, Session, SessionEvent};
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 
 const FRAME: Duration = Duration::from_millis(33);
 /// Redraw at least this often even when idle (for countdowns).
 const IDLE_REDRAW: Duration = Duration::from_millis(250);
 /// How long fresh lines stay highlighted.
 pub const FRESH_FADE: Duration = Duration::from_millis(2500);
+/// Below this width the sidebar starts collapsed.
+const SIDEBAR_AUTO_WIDTH: u16 = 110;
+/// Lines moved per mouse-wheel notch.
+const WHEEL_LINES: isize = 3;
+
+/// A clickable region, recorded while drawing.
+#[derive(Clone, Debug)]
+pub enum Hit {
+    File(String),
+    ToggleSidebar,
+}
 
 pub struct App {
     pub session: Session,
@@ -22,6 +37,13 @@ pub struct App {
     /// Path of the file on screen, to snap (not animate) scroll on flips.
     shown: Option<String>,
     pub message: Option<(String, Instant)>,
+    /// Sidebar open/closed as chosen by the user; `None` follows the
+    /// terminal width.
+    sidebar: Option<bool>,
+    /// Width of the body area, from the last render.
+    pub body_width: u16,
+    /// Clickable regions from the last render.
+    pub hits: Vec<(Rect, Hit)>,
     quit: bool,
 }
 
@@ -38,6 +60,9 @@ impl App {
             viewport: 20,
             shown: None,
             message: None,
+            sidebar: None,
+            body_width: 0,
+            hits: Vec::new(),
             quit: false,
         }
     }
@@ -48,8 +73,10 @@ impl App {
         while !self.quit {
             if event::poll(FRAME)? {
                 while event::poll(Duration::ZERO)? {
-                    if let Event::Key(key) = event::read()? {
-                        self.on_key(key);
+                    match event::read()? {
+                        Event::Key(key) => self.on_key(key),
+                        Event::Mouse(mouse) => self.on_mouse(mouse),
+                        _ => {}
                     }
                     dirty = true;
                 }
@@ -108,6 +135,34 @@ impl App {
         scrolling || fading
     }
 
+    pub fn sidebar_open(&self) -> bool {
+        self.sidebar.unwrap_or(self.body_width >= SIDEBAR_AUTO_WIDTH)
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar = Some(!self.sidebar_open());
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        let now = Instant::now();
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = Position::new(mouse.column, mouse.row);
+                let hit = self.hits.iter().find(|(r, _)| r.contains(pos)).map(|(_, h)| h.clone());
+                match hit {
+                    Some(Hit::File(path)) => {
+                        self.director.select(&path, now);
+                    }
+                    Some(Hit::ToggleSidebar) => self.toggle_sidebar(),
+                    None => {}
+                }
+            }
+            MouseEventKind::ScrollDown => self.director.scroll_by(WHEEL_LINES, now),
+            MouseEventKind::ScrollUp => self.director.scroll_by(-WHEEL_LINES, now),
+            _ => {}
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -135,6 +190,7 @@ impl App {
             KeyCode::Char('-' | '_' | '[') => {
                 self.director.adjust_cycle(false);
             }
+            KeyCode::Char('s') => self.toggle_sidebar(),
             KeyCode::Char('f') => {
                 let follow = !self.director.following();
                 self.director.set_following(follow, now);

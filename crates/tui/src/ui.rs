@@ -7,10 +7,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
-use crate::app::{App, FRESH_FADE};
+use crate::app::{App, FRESH_FADE, Hit};
 
-const SIDEBAR_MIN_WIDTH: u16 = 110;
 const SIDEBAR_WIDTH: u16 = 36;
+/// Width of the strip shown when the sidebar is collapsed.
+const COLLAPSED_WIDTH: u16 = 2;
 
 mod palette {
     use ratatui::style::Color;
@@ -40,14 +41,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_header(frame, header, app);
     draw_footer(frame, footer, app);
 
-    let main = if body.width >= SIDEBAR_MIN_WIDTH {
-        let [side, main] =
-            Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)]).areas(body);
-        draw_sidebar(frame, side, app);
-        main
+    app.hits.clear();
+    app.body_width = body.width;
+    let side_width = if app.sidebar_open() {
+        SIDEBAR_WIDTH.min(body.width / 2)
     } else {
-        body
+        COLLAPSED_WIDTH
     };
+    let [side, main] =
+        Layout::horizontal([Constraint::Length(side_width), Constraint::Min(1)]).areas(body);
+    if app.sidebar_open() {
+        draw_sidebar(frame, side, app);
+    } else {
+        draw_collapsed_sidebar(frame, side, app);
+    }
     draw_diff(frame, main, app);
 }
 
@@ -112,6 +119,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ("n/p", "file"),
         ("f", "follow"),
         ("+/-", "speed"),
+        ("s", "sidebar"),
         ("q", "quit"),
     ];
     let spans: Vec<Span> = keys
@@ -126,22 +134,50 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Line::from(spans), area);
 }
 
-fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+/// A thin strip with an expand button; clicking anywhere on it expands.
+fn draw_collapsed_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
+    let block = Block::new()
+        .borders(Borders::RIGHT)
+        .border_style(Style::new().fg(palette::DIM));
+    frame.render_widget(block, area);
+    frame.render_widget(Span::styled("»", Style::new().fg(palette::ACCENT).bold()), area);
+    app.hits.push((area, Hit::ToggleSidebar));
+}
+
+fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::new()
         .borders(Borders::RIGHT)
         .border_style(Style::new().fg(palette::DIM))
         .title(Span::styled(
             if app.director.fallback_label().is_some() { " Files " } else { " Changed " },
             Style::new().fg(palette::DIM),
-        ));
+        ))
+        .title_top(Line::from(Span::styled("« ", Style::new().fg(palette::ACCENT).bold())).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // The title row collapses the sidebar.
+    app.hits.push((Rect { height: 1, ..area }, Hit::ToggleSidebar));
 
-    let current = app.director.current().map(|d| d.path.as_str());
+    let current = app.director.current().map(|d| d.path.clone());
+    let current = current.as_deref();
     let width = inner.width as usize;
-    let lines: Vec<Line> = app
-        .director
-        .files()
+    let rows = inner.height as usize;
+    let files: Vec<_> = app.director.files().cloned().collect();
+    // Keep the current file in view when the list is longer than the panel.
+    let current_idx = files.iter().position(|d| Some(d.path.as_str()) == current).unwrap_or(0);
+    let offset = (current_idx + 1).saturating_sub(rows);
+    for (row, d) in files.iter().skip(offset).take(rows).enumerate() {
+        let rect = Rect {
+            y: inner.y + row as u16,
+            height: 1,
+            ..inner
+        };
+        app.hits.push((rect, Hit::File(d.path.clone())));
+    }
+    let lines: Vec<Line> = files
+        .iter()
+        .skip(offset)
+        .take(rows)
         .map(|d| {
             let is_current = Some(d.path.as_str()) == current;
             let marker = if is_current {
