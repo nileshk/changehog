@@ -1,4 +1,6 @@
-# changehog
+<p align="center">
+  <img src="assets/changehog-header-image.png" alt="changehog: watch your changes, live" width="640">
+</p>
 
 A live, auto-following diff viewer for watching coding agents (Claude Code,
 etc.) work. Run it in a split pane next to the agent: it shows what changed,
